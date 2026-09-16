@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
-"""KMZ-only bridge inventory generator, version 4.3.
+"""KMZ-only bridge inventory generator.
+Script version: V1.0 (Python script revision, not a BMS standard version).
 Install: py -m pip install lxml Pillow reportlab pypdf
-Run: py bridge_bms.py
+Run: py bridge_bms_v1.0.py
 Tkinter asks for the input KMZ and output folder.
-CLI: py bridge_bms.py "test.kmz" --output-dir "results"
+CLI: py bridge_bms_v1.0.py "test.kmz" --output-dir "results"
 Options: --kmz-only --overwrite --title "Pengabuan / 2026"
 
 The verified KMZ popup table is the sole attribute source.
@@ -17,8 +18,12 @@ Legacy notes stay archived, with no length comparisons.
 All embedded photos and timestamps are preserved. No Excel dependency.
 No engineering condition scores or code compliance are inferred.
 Inputs are never overwritten; existing outputs require confirmation.
+Failed saves restore earlier outputs; any failed recovery reports its backup folder.
+Invisible formatting characters are ignored in IDs, field labels and numbers.
+Source strings remain preserved in the KMZ; PDF IDs validate across text wrapping.
 Supports KML 2.2, doc.kml or one KML, and two-column bridge popup tables.
 Photos must be embedded; missing or corrupt images are reported.
+Photos pass both format verification and full pixel decoding before output.
 Bridge numbers starting with G (case-insensitive) are excluded from the
 PDF register, cards, photos and totals, but retained in the styled KMZ.
 Condition colours: Baik green, Sedang yellow, Rusak Ringan orange,
@@ -28,6 +33,8 @@ PDF: all condition highlighting appears only in the opening summary/register.
 Bridge cards and component tables use neutral styling for every condition.
 PDF includes only the first six photos per bridge, in original source order.
 Its photo total counts displayed photos; the KMZ keeps all original photos.
+PDF photo copies use EXIF orientation and a 300-DPI target without upscaling.
+Resampled photos use JPEG quality 82; transparency is composited onto white.
 PDF and KMZ popup headers include PU and Tanjabbar logos from the paths below.
 Override with --pu-logo and --tanjabbar-logo; --no-logos explicitly disables them.
 Missing or unreadable logo files produce an actionable error before output writes.
@@ -41,22 +48,27 @@ from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import html
 import io
+from math import ceil
 from pathlib import Path, PurePosixPath
 import re
+import shutil
 import sys
 import tempfile
 import logging
 import time
+import unicodedata
 from urllib.parse import unquote, urlsplit
 import zipfile
 
 try:
     from lxml import etree as ET
-    from PIL import Image, ImageDraw
+    from PIL import Image, ImageDraw, ImageOps
 except ImportError as exc:
     raise SystemExit('Missing dependency. Run: py -m pip install lxml Pillow reportlab pypdf') from exc
 
 KML = 'http://www.opengis.net/kml/2.2'
+PDF_PHOTO_DPI = 300
+PDF_PHOTO_JPEG_QUALITY = 82
 LOG = logging.getLogger('bridge_bms')
 LOG.addHandler(logging.NullHandler())
 CURRENT_CONTEXT = 'Startup'
@@ -130,24 +142,32 @@ POLICY = ('Data acuan: tabel KMZ terverifikasi menurut pemilik data. '
           'Catatan lama diarsipkan tanpa perbandingan panjang. NK BMS tidak dihitung.')
 MISSING = {'', '-', '–', '—', 'n/a', 'na', 'none', 'null', 'nan'}
 
+def clean_text(value):
+    """Remove nonprinting format characters for interpretation and PDF display."""
+    return ''.join(c for c in str(value if value is not None else '')
+                   if unicodedata.category(c) != 'Cf')
+
 def is_missing(value):
-    return value is None or str(value).strip().casefold() in MISSING
+    return clean_text(value).strip().casefold() in MISSING
 
 def bridge_key(value):
-    import unicodedata
+    return clean_text(value).strip().upper()
 
-    text = str(value or '')
-    text = ''.join(
-        char for char in text
-        if unicodedata.category(char) != 'Cf'
-    )
-    return text.strip().upper()
+def pdf_has_bridge_id(pages, ident):
+    # PDF extraction may split an ID across lines. Require the complete ID,
+    # so J-...-1 cannot be satisfied by J-...-10 or another longer identifier.
+    key = re.sub(r'\s+', '', bridge_key(ident))
+    if not key:
+        return False
+    pattern = re.compile(r'(?<![\w.-])' + r'\s*'.join(map(re.escape, key))
+                         + r'(?![\w.-])')
+    return any(pattern.search(bridge_key(page)) for page in pages)
 
 def display(value):
     return '-' if is_missing(value) else str(value).strip()
 
 def condition_name(value):
-    normalized = re.sub(r'[\s_\-]+', ' ', str(value or '').strip()).casefold()
+    normalized = re.sub(r'[\s_\-]+', ' ', clean_text(value).strip()).casefold()
     return next((k for k in PALETTE if k.casefold() == normalized), display(value))
 
 def condition_color(value):
@@ -163,7 +183,7 @@ def make_title(bridges):
     def unique(field):
         seen, result = set(), []
         for b in bridges:
-            v = re.sub(r'\s+', ' ', str(b.fields.get(field) or '')).strip()
+            v = re.sub(r'\s+', ' ', clean_text(b.fields.get(field))).strip()
             if not is_missing(v) and v.casefold() not in seen:
                 seen.add(v.casefold()); result.append(v)
         return result
@@ -172,7 +192,7 @@ def make_title(bridges):
 
 def canonical_field(value):
     # Ignore harmless HTML whitespace, capitalisation and trailing colons.
-    key = re.sub(r'\s+', ' ', value).strip().rstrip(':').strip()
+    key = re.sub(r'\s+', ' ', clean_text(value)).strip().rstrip(':').strip()
     lookup = {k.casefold(): k for k in (*REQUIRED, 'Kecamatan', 'Tahun Survey')}
     lookup['tahun survei'] = 'Tahun Survey'
     return lookup.get(key.casefold(), key)
@@ -192,7 +212,7 @@ def escape(value):
 def number(value):
     if is_missing(value):
         return None
-    s = str(value).strip().replace(',', '.')
+    s = clean_text(value).strip().replace(',', '.')
     try:
         n = Decimal(s)
     except InvalidOperation as exc:
@@ -204,7 +224,7 @@ def number(value):
 def sta_number(value):
     if is_missing(value):
         return None
-    s = str(value).strip().replace(',', '.')
+    s = clean_text(value).strip().replace(',', '.')
     if '+' in s:
         if not re.fullmatch(r'\d+\+\d{1,3}(?:\.\d+)?', s):
             raise ValueError(f'Invalid station: {value!r}')
@@ -276,6 +296,9 @@ def load_input(path):
         LOG.info('PARSE: placemark %d/%d | %s', pm_index, len(placemarks),
                  pm.findtext('k:name', default='Unnamed', namespaces=NS))
         h = ET.HTML(pm.findtext('k:description', default='', namespaces=NS) or '<html/>')
+        if h is None:  # Whitespace/comment-only descriptions are valid non-bridge placemarks.
+            skipped += 1
+            continue
         fields = {}
         for tr in h.xpath('//tr'):
             cells = tr.xpath('./td | ./th')
@@ -329,8 +352,14 @@ def load_input(path):
         for href in h.xpath('//img[not(@data-bms-logo)]/@src'):
             context('Checking embedded photo', pm, ident, f'photo={href!r}')
             member = photo_member(href, kml_name, payload)
-            with Image.open(io.BytesIO(payload[member])) as image:
-                image.verify()
+            try:
+                with Image.open(io.BytesIO(payload[member])) as image:
+                    image.verify()
+                # verify() does not decode JPEG pixels; reopen to catch truncation.
+                with Image.open(io.BytesIO(payload[member])) as image:
+                    image.load()
+            except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
+                raise ValueError(f'{ident} / photo {member!r}: invalid image: {exc}') from exc
             photos.append((href, member))
         bridges.append(Bridge(pm, fields, photos))
         LOG.info('PARSE OK: %s | %d photos checked', ident, len(photos))
@@ -352,10 +381,14 @@ def order_feature(element):
             'styleUrl': 9, 'Style': 10, 'StyleMap': 10, 'Region': 11,
             'Metadata': 12, 'ExtendedData': 12, 'Schema': 13}
     children = list(element)
+    # Comments and processing instructions are not element tags. Keep their
+    # slots while reordering only the KML elements.
+    ordered = iter(sorted((child for child in children if isinstance(child.tag, str)),
+                          key=lambda e: rank.get(ET.QName(e).localname, 14)))
     for child in children:
         element.remove(child)
-    for child in sorted(children, key=lambda e: rank.get(ET.QName(e).localname, 14)):
-        element.append(child)
+    for child in children:
+        element.append(next(ordered) if isinstance(child.tag, str) else child)
 
 def popup(b, title, logo_refs=()):
     d = b.fields
@@ -504,7 +537,7 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
                                                ('heading', 17, True, NAVY), ('section', 11, True, NAVY),
                                                ('white', 10, True, '#FFFFFF')]}
     def p(value, style='body'):
-        return Paragraph(escape(value), styles[style])
+        return Paragraph(escape(clean_text(value)), styles[style])
     def table(rows, widths, header=False, repeat_first=False):
         cells = [[p(v, 'white' if header and i == 0 else 'body') for v in row] for i, row in enumerate(rows)]
         condition_cells = []
@@ -518,7 +551,7 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
                 value = row[col]
                 if len(row) == 2:
                     continue
-                cells[i][col] = Paragraph(escape(value), ParagraphStyle('condition',fontName='Helvetica',
+                cells[i][col] = Paragraph(escape(clean_text(value)), ParagraphStyle('condition',fontName='Helvetica',
                     fontSize=9,leading=12,textColor=colors.HexColor(condition_ink(value))))
                 condition_cells.append(('BACKGROUND',(col,i),(col,i),colors.HexColor(condition_color(value))))
         t = Table(cells, colWidths=widths, repeatRows=1 if header or repeat_first else 0, hAlign='LEFT')
@@ -532,16 +565,32 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
         t.setStyle(TableStyle(commands))
         return t
     def photograph(member, max_width, max_height):
-        with Image.open(io.BytesIO(payload[member])) as im:
-            iw, ih = im.size
-        scale = min(max_width / iw, max_height / ih)
-        return RLImage(io.BytesIO(payload[member]), width=iw * scale, height=ih * scale)
+        buf = io.BytesIO()
+        with Image.open(io.BytesIO(payload[member])) as source:
+            with ImageOps.exif_transpose(source) as im:
+                iw, ih = im.size
+                scale = min(max_width / iw, max_height / ih)
+                draw_width, draw_height = iw * scale, ih * scale
+                # ReportLab uses points (72 per inch), not screen pixels.
+                bounds = (max(1, ceil(draw_width * PDF_PHOTO_DPI / 72)),
+                          max(1, ceil(draw_height * PDF_PHOTO_DPI / 72)))
+                im.thumbnail(bounds, Image.Resampling.LANCZOS)
+                if (source.format == 'JPEG' and source.mode in ('RGB', 'L')
+                        and source.getexif().get(274, 1) == 1 and im.size == (iw, ih)):
+                    # Avoid another lossy encoding when a JPEG already fits.
+                    buf = io.BytesIO(payload[member])
+                else:
+                    with im.convert('RGBA') as rgba, Image.new('RGB', im.size, 'white') as rgb:
+                        rgb.paste(rgba, mask=rgba.getchannel('A'))
+                        rgb.save(buf, format='JPEG', quality=PDF_PHOTO_JPEG_QUALITY)
+        buf.seek(0)
+        return RLImage(buf, width=draw_width, height=draw_height)
     def page_decoration(c, doc):
         context('Rendering PDF', detail=f'page={doc.page}; see preceding PDF PREPARE logs for bridge details')
         LOG.info('PDF RENDER: page %d', doc.page)
         c.saveState()
         c.setFillColor(colors.HexColor(NAVY)); c.rect(0, A4[1] - 84, A4[0], 84, fill=1, stroke=0)
-        heading = Paragraph(escape(title.upper()), ParagraphStyle('header', fontName='Helvetica-Bold',
+        heading = Paragraph(escape(clean_text(title).upper()), ParagraphStyle('header', fontName='Helvetica-Bold',
                             fontSize=10, leading=12, textColor=colors.HexColor('#73CCC0')))
         text_width = width - (110 if logos else 0)
         _, hh = heading.wrap(text_width, 26)
@@ -605,7 +654,7 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
         status = d['Kondisi Jembatan (Keseluruhan)']
         story += [p(f'{i:02d} / Kartu inventaris', 'section'), p(d['Nama Jembatan'], 'heading'),
                   p(d['No. Jembatan'] + ' | STA ' + station(d['STA(m)']))]
-        band_text = Paragraph(escape('KONDISI: ' + status.upper() + ' / NK BMS: TIDAK DIHITUNG'),
+        band_text = Paragraph(escape('KONDISI: ' + clean_text(status).upper() + ' / NK BMS: TIDAK DIHITUNG'),
             ParagraphStyle('band',fontName='Helvetica-Bold',fontSize=10,leading=14,
                            textColor=colors.HexColor(NAVY)))
         band = Table([[band_text]], colWidths=[width])
@@ -652,37 +701,91 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
         context('Extracting PDF text', detail=f'page={page_index}')
         LOG.info('PDF VALIDATE: extracting page %d/%d', page_index, len(reader.pages))
         extracted.append(page.extract_text() or '')
-    content = '\n'.join(extracted)
     failures = []
     for i, b in enumerate(bridges, 1):
         ident = b.fields['No. Jembatan']
         context('Validating PDF bridge ID', b.pm, ident)
-        if ident not in content:
+        if not pdf_has_bridge_id(extracted, ident):
             failures.append(f'bridge ID={ident!r}; '+placemark_details(b.pm))
-            LOG.error('PDF VALIDATE: ID not found verbatim | %r | %s', ident, b.fields['Nama Jembatan'])
+            LOG.error('PDF VALIDATE: complete ID not found after normalization | %r | %s', ident, b.fields['Nama Jembatan'])
         else:
             LOG.info('PDF VALIDATE: bridge %d/%d OK | %s', i, len(bridges), ident)
     if failures:
         raise ValueError('PDF validation failed: missing bridge ID(s) in extracted text: '
                          + '\n' + '\n'.join(failures)
-                         + '. This can be a text wrapping/font extraction issue; see terminal diagnostics.')
+                         + '. IDs were checked after removing invisible formatting and allowing line wrapping; see terminal diagnostics.')
     LOG.info('PDF: validation passed | %d pages', len(reader.pages))
     return len(reader.pages)
 
-def prepare_job(args):
+def job_paths(args):
+    """Resolve destinations without reading the archive (safe on the GUI thread)."""
     source = Path(args.input).expanduser().resolve()
+    context('Checking input and output paths', detail=str(source))
     if not source.is_file():
         raise ValueError(f'Input file not found: {source}')
-    root, payload, kml_name, bridges, skipped = load_input(source)
-    title = args.title or make_title(bridges)
-    out = (args.output_dir or source.parent / (source.stem + '_bms_output')).resolve()
+    out = Path(args.output_dir or source.parent / (source.stem + '_bms_output')).expanduser().resolve()
     targets = [out / (source.stem + '_BMS.kmz')]
     if not args.kmz_only:
         targets.append(out / (source.stem + '_Dossier.pdf'))
     for target in targets:
         if target.resolve() == source:
             raise ValueError('Refusing to overwrite input.')
+    return source, out, targets
+
+def prepare_job(args):
+    source, out, targets = job_paths(args)
+    root, payload, kml_name, bridges, skipped = load_input(source)
+    title = args.title or make_title(bridges)
     return source, root, payload, kml_name, bridges, skipped, title, out, targets
+
+def publish_outputs(staged, targets, overwrite):
+    """Publish the validated pair, restoring previous files on a normal save error."""
+    existing = [target for target in targets if target.exists()]
+    for target in existing:
+        if not overwrite:
+            raise ValueError(f'Output exists: {target}. Use another --output-dir or --overwrite.')
+        if not target.is_file():
+            raise ValueError(f'Output path is not a file: {target}')
+    # Keep backups outside the auto-deleted staging directory. If recovery also
+    # fails (e.g. a locked Windows file), the originals remain available here.
+    backup_dir = (Path(tempfile.mkdtemp(prefix='bridge_bms_backup_', dir=targets[0].parent))
+                  if existing else None)
+    backups, published, recovery_errors = {}, [], []
+    try:
+        for target in existing:
+            context('Backing up previous output', detail=str(target))
+            backup = backup_dir / target.name
+            shutil.copy2(target, backup)
+            backups[target] = backup
+        for temporary, target in zip(staged, targets):
+            context('Saving validated output', detail=str(target))
+            LOG.info('SAVE: %s', target)
+            if target.exists() and not overwrite:
+                raise ValueError(f'Output appeared during processing: {target}')
+            temporary.replace(target)
+            published.append(target)
+    except Exception as exc:
+        for target in reversed(published):
+            try:
+                if target in backups:
+                    backups[target].replace(target)
+                else:
+                    target.unlink()
+            except OSError as recovery:
+                recovery_errors.append(f'{target}: {recovery}')
+        if recovery_errors:
+            raise OSError(f'Save failed: {exc}. Recovery also failed: '
+                          + '; '.join(recovery_errors)
+                          + (f'. Previous outputs retained in: {backup_dir}' if backup_dir else '')
+                          + '. Close files in other applications before retrying.') from exc
+        raise
+    finally:
+        # Failed recovery deliberately leaves the backups for manual recovery.
+        if backup_dir and not recovery_errors:
+            try:
+                shutil.rmtree(backup_dir)
+            except OSError as exc:
+                LOG.warning('Could not remove backup folder %s: %s', backup_dir, exc)
 
 def execute_job(args, job):
     started = time.monotonic()
@@ -702,10 +805,7 @@ def execute_job(args, job):
         pdf_title = args.title or make_title(pdf_bridges)
         pages = None if args.kmz_only else write_pdf(staged[1], pdf_bridges, payload, pdf_title,
                                                     source.name, logos)
-        for temporary, target in zip(staged, targets):
-            context('Saving validated output', detail=str(target))
-            LOG.info('SAVE: %s', target)
-            temporary.replace(target)
+        publish_outputs(staged, targets, args.overwrite)
     LOG.info('DONE: all outputs saved | %.1f seconds', time.monotonic() - started)
     return (f'OK: {len(bridges)} jembatan; {sum(len(b.photos) for b in bridges)} foto.\n'
             f'{updated} koordinat diperbarui; {skipped} placemark non-jembatan dipertahankan.\n'
@@ -718,6 +818,7 @@ def run_gui(args):
     import queue
     import threading
     win = tk.Tk(); win.withdraw()
+    exit_code = 0
     try:
         source = filedialog.askopenfilename(parent=win, title='1. Pilih file KMZ jembatan',
                                             filetypes=[('KMZ', '*.kmz')])
@@ -728,8 +829,7 @@ def run_gui(args):
         if not destination:
             return 0
         args.input, args.output_dir = source, Path(destination)
-        job = prepare_job(args)
-        targets = job[8]
+        _, _, targets = job_paths(args)
         existing = [p for p in targets if p.exists()]
         if existing and not args.overwrite:
             if not messagebox.askyesno('Hasil sudah ada', 'Ganti file hasil berikut?\n' +
@@ -745,11 +845,14 @@ def run_gui(args):
         results = queue.Queue()
         def worker():
             try:
-                results.put((True, execute_job(args, job)))
+                # Archive reads, image decoding and PDF generation all run after
+                # the progress window opens, without blocking Tk's event loop.
+                results.put((True, execute_job(args, prepare_job(args))))
             except Exception as exc:
                 LOG.exception('FAILED: %s', failure_details(exc))
                 results.put((False, failure_details(exc)))
         def poll():
+            nonlocal exit_code
             try:
                 ok, result = results.get_nowait()
             except queue.Empty:
@@ -759,6 +862,7 @@ def run_gui(args):
             if ok:
                 messagebox.showinfo('Selesai', result, parent=win)
             else:
+                exit_code = 1
                 messagebox.showerror('Gagal membuat hasil', result, parent=win)
             win.quit()
         # Do not terminate halfway through writing if the progress window closes.
@@ -771,7 +875,7 @@ def run_gui(args):
         return 1
     finally:
         win.destroy()
-    return 0
+    return exit_code
 
 def main(argv=None):
     configure_logging()
@@ -794,6 +898,6 @@ def main(argv=None):
 if __name__ == '__main__':
     try:
         sys.exit(main())
-    except (ValueError, OSError, zipfile.BadZipFile, ET.XMLSyntaxError) as exc:
+    except Exception as exc:
         LOG.exception('FAILED: %s', failure_details(exc))
         sys.exit(1)

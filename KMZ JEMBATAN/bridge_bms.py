@@ -1,13 +1,20 @@
 #!/usr/bin/env python3
-"""KMZ-only bridge inventory generator.
+"""Bridge inventory generator with optional PKRMS Excel import.
 Script version: V1.0 (Python script revision, not a BMS standard version).
-Install: py -m pip install lxml Pillow reportlab pypdf
+Install: py -m pip install lxml Pillow reportlab pypdf openpyxl
 Run: py bridge_bms_v1.0.py
-Tkinter asks for the input KMZ and output folder.
+Tkinter asks for the KMZ, data source (KMZ or PKRMS Excel), and output folder.
 CLI: py bridge_bms_v1.0.py "test.kmz" --output-dir "results"
+Excel: py bridge_bms_v1.0.py "test.kmz" --pkrms "INPUT_PKRMS_JEMBATAN.xlsx"
+Use --pkrms without a path to read DEFAULT_PKRMS_PATH below.
 Options: --kmz-only --overwrite --title "Pengabuan / 2026"
 
-The verified KMZ popup table is the sole attribute source.
+KMZ mode uses the existing verified popup table. Excel mode matches Bridge_Number
+to the table ID, or to a raw bridge Point's name, ignoring case/invisible formatting.
+Excel columns replace matched survey fields; absent columns retain existing values.
+Unmatched bridges retain their existing attributes and are reported in the terminal.
+Excel mode keeps map Point coordinates and photos from the KMZ. All Excel columns
+are retained in ExtendedData on matched bridges; the workbook is read-only.
 Blank cells, absent optional columns, -, en/em dashes, N/A, NA, None,
 null and NaN are treated as unavailable and displayed as -; never as zero.
 STA is formatted only when available. Missing table coordinates retain
@@ -15,11 +22,13 @@ the complete existing KMZ Point location (no mixing partial coordinate pairs).
 Malformed nonempty numbers still report the bridge ID and field.
 A bridge ID and a usable Point location remain necessary.
 Legacy notes stay archived, with no length comparisons.
-All embedded photos and timestamps are preserved. No Excel dependency.
+All embedded photos and timestamps are preserved. openpyxl is needed only for Excel mode.
 Output photo filenames use "<bridge number> - (n)<original extension>",
 starting at 1 for each bridge. Popup and archived photo links are updated.
 Photo bytes, source order and the original input KMZ remain unchanged.
-No engineering condition scores or code compliance are inferred.
+PKRMS code mappings and condition offsets follow the supplied enrichment script.
+Missing condition inputs make the affected label unavailable, not "Baik".
+Available inputs use its worst-condition/clamping rule; no NK BMS score is inferred.
 Inputs are never overwritten; existing outputs require confirmation.
 Failed saves restore earlier outputs; any failed recovery reports its backup folder.
 Invisible formatting characters are ignored in IDs, field labels and numbers.
@@ -47,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 from collections import Counter
+from contextlib import ExitStack
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 import html
@@ -117,6 +127,54 @@ PALETTE = {'Baik': '#00FF0D', 'Sedang': '#F9EE25',
            'Rusak Ringan': '#FF8000', 'Rusak Berat': '#FF0000'}
 PU_LOGO = Path(r'D:\\DEV\\assets\\logo_pupr.png')
 TANJABBAR_LOGO = Path(r'D:\\DEV\\assets\\logo_TanjabBarat_2048.png')
+DEFAULT_PKRMS_PATH = Path(r'D:\15.09 TANJUNG JABUNG BARAT\SURVEY KONDISI JEMBATAN\DOKUMEN\INPUT_PKRMS_JEMBATAN.xlsx')
+
+# Mappings copied from the user's enrich_bridge_kmz_from_pkrms_excel.py.
+CODE_BRIDGE_TYPE = {
+    1: 'Gorong-gorong Bulat', 2: 'Gorong-gorong Oval', 3: 'Gorong-gorong Kotak',
+    4: 'Oval', 5: 'Gelagar', 6: 'Balok Oval', 7: 'Komposit', 8: 'Plat',
+    9: 'Rangka Baja', 10: 'Jembatan Gantung', 11: 'Jembatan Kabel Pancang',
+    12: 'Jembatan Sementara', 13: 'Lintasan Kereta', 14: 'Lintasan Sungai',
+    15: 'Lintasan Feri', 16: 'Lainnya', 17: 'Struktur Diperlukan',
+}
+CODE_BRIDGE_TYPE_SHORTCODE = dict(enumerate(
+    ('YTI', 'API', 'BTI', 'EMI', 'GBI', 'LLI', 'MLI', 'PTI', 'RBA', 'TBI',
+     'CBI', 'SBW', 'KLI', 'WTI', 'FLI', 'ULL', 'XXX'), 1))
+CODE_PONDASI_TYPE = dict(enumerate(
+    ('Cakar Ayam', 'Langsung', 'Tiang Pancang', 'Tiang Bor', 'Tiang Ulir', 'Sumuran', 'Lainnya'), 1))
+CODE_BANGBWAH_TYPE = {1: 'Cap (Kepala Tiang)', 2: 'Dinding Penuh', 3: 'Kepala Jembatan Khusus'}
+CODE_MATERIAL = dict(enumerate((
+    'Kayu', 'Pasangan Bata', 'Pasangan Batu', 'Bronjong Dan Sejenisnya',
+    'Pasangan Batu Kosong', 'Beton Tak Bertulang', 'Beton Bertulang',
+    'Beton Pratekan', 'Baja', 'Plat Baja Bergelombang', 'Komposit Baja-Beton',
+    'Aluminium', 'Neoprene/Karet', 'Teflon', 'PVC', 'Geotextile',
+    'Tanah Biasa/Lempung atau Timbunan', 'Aspal', 'Kerikil', 'Macadam', 'Bahan Asli', 'Lain-Lain'), 1))
+CODE_LANTAI_TYPE = {**CODE_MATERIAL, 6: 'Beton Bertulang'}
+PKRMS_DIRECT = {
+    'STA(m)': 'Chainage', 'Panjang(m)': 'Bridge_Length', 'Lebar(m)': 'Road_Width',
+    'Jumlah Bentang': 'Number_Spans', 'Tahun Konstruksi': 'Year_Construction', 'Tahun Survey': 'Year',
+}
+PKRMS_CODE_FIELDS = {
+    'Bangunan Atas - Kode': ('Bridge_Type', CODE_BRIDGE_TYPE_SHORTCODE),
+    'Bangunan Atas - Tipe': ('Bridge_Type', CODE_BRIDGE_TYPE),
+    'Bangunan Bawah - Tipe': ('BangbwahType', CODE_BANGBWAH_TYPE),
+    'Bangunan Bawah - Bahan': ('BahanBangbwah', CODE_MATERIAL),
+    'Fondasi - Tipe': ('PondasiType', CODE_PONDASI_TYPE),
+    'Fondasi - Bahan': ('BahanPond', CODE_MATERIAL),
+    'Permukaan Jembatan - Tipe': ('LantaiType', CODE_LANTAI_TYPE),
+}
+PKRMS_CONDITIONS = {
+    'Bangunan Atas - Kondisi': (('Cond_DeckJoints', 1), ('Cond_Beam', 0)),
+    'Bangunan Bawah - Kondisi': (('Cond_Piers', 0), ('Cond_Bearings', 0),
+                               ('Cond_WingWalls', 1), ('Cond_Abutment', 0)),
+    'Fondasi - Kondisi': (('Cond_Foundations', 0),),
+    'Permukaan Jembatan - Kondisi': (('Cond_RoadSurface', 2), ('Cond_Deck', 1)),
+    'Kondisi Jembatan (Keseluruhan)': (
+        ('Cond_Piers', 0), ('Cond_Bearings', 0), ('Cond_Foundations', 0), ('Cond_Scouring', 1),
+        ('Cond_RoadSurface', 2), ('Cond_Deck', 1), ('Cond_DeckJoints', 1), ('Cond_Beam', 0),
+        ('Cond_WingWalls', 1), ('Cond_Abutment', 0)),
+}
+BRIDGE_NAME_PATTERN = re.compile(r'^([GJ]-\d+(?:\.\d+)*-\d+)(?:\s+(.*))?$', re.IGNORECASE)
 
 def load_logos(paths):
     result = []
@@ -141,7 +199,7 @@ REQUIRED = ('No. Jembatan', 'Nama Jembatan', 'Longitude', 'Latitude',
             'STA(m)', 'Panjang(m)', 'Lebar(m)', 'Jumlah Bentang',
             'Kondisi Jembatan (Keseluruhan)')
 GENERATED_ROWS = {'Catatan asli (Description)', 'Status penilaian', 'Sumber nilai', 'STA tampilan'}
-POLICY = ('Data acuan: tabel KMZ terverifikasi menurut pemilik data. '
+POLICY = ('Data acuan: tabel KMZ atau Excel PKRMS; sumber dicantumkan pada setiap kartu. '
           'Nilai tidak tersedia ditampilkan sebagai tanda hubung, bukan nol. '
           'Catatan lama diarsipkan tanpa perbandingan panjang. NK BMS tidak dihitung.')
 MISSING = {'', '-', '–', '—', 'n/a', 'na', 'none', 'null', 'nan'}
@@ -248,12 +306,204 @@ def station(value):
     fraction = fraction.rstrip('0')
     return f'{km}+{int(whole):03d}' + ('.' + fraction if fraction else '')
 
+INVENTORY_FIELDS = (
+    'No. Jembatan', 'Nama Jembatan', 'Longitude', 'Latitude', 'Kecamatan',
+    'STA(m)', 'Panjang(m)', 'Lebar(m)', 'Jumlah Bentang',
+    'Bangunan Atas - Kode', 'Bangunan Atas - Tipe', 'Bangunan Atas - Kondisi',
+    'Bangunan Bawah - Tipe', 'Bangunan Bawah - Bahan', 'Bangunan Bawah - Kondisi',
+    'Fondasi - Tipe', 'Fondasi - Bahan', 'Fondasi - Kondisi',
+    'Permukaan Jembatan - Tipe', 'Permukaan Jembatan - Kondisi',
+    'Tahun Konstruksi', 'Kondisi Jembatan (Keseluruhan)', 'Tahun Survey',
+)
+PKRMS_RAW_PREFIX = 'pkrms_raw:'
+
+@dataclass
+class PKRMSWorkbook:
+    path: Path
+    sheet: str
+    records: dict  # normalized Bridge_Number -> (Excel row number, all column values)
+
+def pkrms_header(value):
+    return re.sub(r'[\s_]+', '', clean_text(value)).casefold()
+
+def index_pkrms_rows(rows, path, sheet):
+    """Validate identifiers/headers before making any change to bridge data."""
+    rows = iter(rows)
+    raw_headers = next(rows, ())
+    known = {'Bridge_Number', 'Bridge_Name', *PKRMS_DIRECT.values(),
+             *(col for col, _ in PKRMS_CODE_FIELDS.values()),
+             *(col for group in PKRMS_CONDITIONS.values() for col, _ in group)}
+    canonical = {pkrms_header(col): col for col in known}
+    headers, seen = [], set()
+    for value in raw_headers:
+        label = clean_text(value).strip()
+        key = pkrms_header(label)
+        if key and key in seen:
+            raise ValueError(f'{path.name} / {sheet}: duplicate Excel column {label!r}.')
+        seen.add(key)
+        headers.append(canonical.get(key, label))
+    if 'Bridge_Number' not in headers:
+        raise ValueError(f'{path.name} / {sheet}: first row must contain Bridge_Number.')
+    records = {}
+    for row_number, row in enumerate(rows, 2):
+        context('Reading PKRMS Excel row', detail=f'{path.name} / {sheet} / row={row_number}')
+        if all(is_missing(value) for value in row):
+            continue
+        record = {key: value for key, value in zip(headers, row) if key}
+        ident = bridge_key(record.get('Bridge_Number'))
+        if is_missing(ident):
+            raise ValueError(f'{path.name} / {sheet} / row {row_number}: missing Bridge_Number.')
+        if ident in records:
+            raise ValueError(f'{path.name} / {sheet}: duplicate Bridge_Number {ident!r} '
+                             f'at rows {records[ident][0]} and {row_number}.')
+        records[ident] = (row_number, record)
+    if not records:
+        raise ValueError(f'{path.name} / {sheet}: no PKRMS bridge rows found.')
+    LOG.info('EXCEL: %d bridge records | %s / %s', len(records), path.name, sheet)
+    return PKRMSWorkbook(path, sheet, records)
+
+def load_pkrms_data(path):
+    """Read the first worksheet, including cached formula values; never save it."""
+    try:
+        import openpyxl
+    except ImportError as exc:
+        raise ValueError('Excel import needs openpyxl. Run: py -m pip install openpyxl') from exc
+    path = Path(path).expanduser().resolve()
+    context('Opening PKRMS Excel', detail=str(path))
+    if not path.is_file():
+        raise ValueError(f'PKRMS Excel file not found: {path}')
+    LOG.info('EXCEL: opening %s', path)
+    with ExitStack() as stack:
+        cached = openpyxl.load_workbook(path, read_only=True, data_only=True)
+        stack.callback(cached.close)
+        formulas = openpyxl.load_workbook(path, read_only=True, data_only=False)
+        stack.callback(formulas.close)
+        sheet, original = cached.worksheets[0], formulas.worksheets[0]
+        def rows():
+            for cells, source_cells in zip(sheet.iter_rows(), original.iter_rows()):
+                for cell, source in zip(cells, source_cells):
+                    if cell.data_type == 'e':
+                        raise ValueError(f'{path.name} / {sheet.title}!{cell.coordinate}: Excel error {cell.value}.')
+                    if source.data_type == 'f' and cell.value is None:
+                        raise ValueError(f'{path.name} / {sheet.title}!{source.coordinate}: '
+                                         'formula has no cached value. Recalculate and save in Excel first.')
+                yield tuple(cell.value for cell in cells)
+        return index_pkrms_rows(rows(), path, sheet.title)
+
+def pkrms_integer(value, ident, column):
+    n = field_number(value, ident, 'PKRMS.' + column)
+    if n is not None and n != n.to_integral_value():
+        raise ValueError(f'{ident} / PKRMS.{column}: expected an integer code, got {value!r}.')
+    return None if n is None else int(n)
+
+def pkrms_condition(record, inputs, ident):
+    """Use the supplied offsets/max rule only when all required cells are present."""
+    adjusted, missing = [], []
+    for column, offset in inputs:
+        value = pkrms_integer(record.get(column), ident, column)
+        if value is None:
+            missing.append(column)
+        elif value - offset < 6:
+            adjusted.append(value - offset)
+    if missing or not adjusted:
+        return '-', missing
+    result = max(1, max(adjusted))
+    result = 4 if result == 5 else result
+    return {1: 'Baik', 2: 'Sedang', 3: 'Rusak Ringan', 4: 'Rusak Berat'}[result], []
+
+def apply_pkrms_fields(fields, record, ident):
+    """Replace imported attributes; absent columns leave existing attributes intact."""
+    values = dict(fields)
+    if is_missing(values.get('Nama Jembatan')) and not is_missing(record.get('Bridge_Name')):
+        values['Nama Jembatan'] = display(record['Bridge_Name'])
+    for label, column in PKRMS_DIRECT.items():
+        if column not in record:
+            continue
+        value = record[column]
+        if column == 'Chainage':
+            try:
+                value = station(value)
+            except ValueError as exc:
+                raise ValueError(f'{ident} / PKRMS.Chainage: {exc}') from exc
+        elif column in ('Year', 'Year_Construction'):
+            value = pkrms_integer(value, ident, column)
+            if column == 'Year_Construction' and value == 0:
+                value = None
+        # Other dimensions are validated by load_input after the import.
+        values[label] = display(value)
+    for label, (column, codes) in PKRMS_CODE_FIELDS.items():
+        if column not in record:
+            continue
+        code = pkrms_integer(record[column], ident, column)
+        if code is None:
+            values[label] = '-'
+        elif code in codes:
+            values[label] = codes[code]
+        else:
+            values[label] = f'Kode {code} (belum dipetakan)'
+            LOG.warning('EXCEL CODE: %s | %s=%s is not in the supplied lookup table', ident, column, code)
+    missing, unavailable = set(), False
+    for label, inputs in PKRMS_CONDITIONS.items():
+        # A workbook without any of this group's columns does not replace that group.
+        if not any(column in record for column, _ in inputs):
+            continue
+        values[label], absent = pkrms_condition(record, inputs, ident)
+        missing.update(absent)
+        unavailable |= values[label] == '-'
+    values.pop('Catatan kondisi PKRMS', None)
+    if missing:
+        values['Catatan kondisi PKRMS'] = 'Isian kondisi tidak lengkap; label terkait tidak dihitung.'
+        LOG.warning('EXCEL CONDITION: %s | missing inputs: %s; affected labels remain unavailable',
+                    ident, ', '.join(sorted(missing)))
+    elif unavailable:
+        values['Catatan kondisi PKRMS'] = 'Sebagian data kondisi tidak tersedia/tidak berlaku.'
+    values['Status PKRMS'] = 'Cocok berdasarkan nomor jembatan'
+    return values
+
+def split_bridge_name(pm):
+    text = clean_text(pm.findtext('k:name', default='', namespaces=NS)).strip()
+    match = BRIDGE_NAME_PATTERN.fullmatch(text)
+    return (bridge_key(match[1]), display(match[2])) if match else (None, '-')
+
+def district_from_kmz(pm):
+    # Nearest matching folder wins, so a multi-district KMZ keeps local context.
+    for parent in pm.iterancestors():
+        if parent.tag not in (q('Folder'), q('Document')):
+            continue
+        title = clean_text(parent.findtext('k:name', default='', namespaces=NS)).strip()
+        match = re.search(r'\bKECAMATAN\s+(.+?)(?:\s*/\s*\d{4})?$', title, re.IGNORECASE)
+        if match:
+            return match[1].strip().title()
+        match = re.fullmatch(r'([^/]+?)\s*/\s*\d{4}', title)
+        if match and not re.search(r'\b(RUAS|JALAN|ROAD|SURVEY|INVENTARIS)\b', match[1], re.IGNORECASE):
+            return display(match[1])
+    return '-'
+
+def bridge_photos(pm, description, kml_name, payload):
+    """Keep popup order and add metadata-only photos; do not count header logos."""
+    hrefs = description.xpath('//img[not(@data-bms-logo)]/@src') if description is not None else []
+    photos = [(href, photo_member(href, kml_name, payload)) for href in hrefs]
+    known = {member for _, member in photos}
+    for node in pm.xpath('.//k:SimpleData[@name="pdfmaps_photos"] | '
+                         './/k:Data[@name="pdfmaps_photos"]/k:value', namespaces=NS):
+        h = ET.HTML(node.text or '<html/>')
+        if h is None:
+            continue
+        metadata = [(href, photo_member(href, kml_name, payload))
+                    for href in h.xpath('//img[not(@data-bms-logo)]/@src')]
+        # All entries from a metadata-only source keep their order and repeats.
+        photos.extend(pair for pair in metadata if pair[1] not in known)
+        known.update(member for _, member in metadata)
+    return photos
+
 @dataclass
 class Bridge:
     pm: object
     fields: dict
     photos: list  # (current href, ZIP member), in original source order
-    authority: str = 'KMZ Hasil Survey 2026'
+    authority: str = 'KMZ / tabel sumber'
+    pkrms_record: dict | None = None
+    imported: bool = False
 
 def photo_member(href, kml_name, names):
     parts = urlsplit(href)
@@ -372,7 +622,7 @@ def rename_bridge_photos(root, payload, kml_name, bridges):
     LOG.info('PHOTO NAME: %d photo entries named across %d bridges', len(renamed), len(bridges))
     return result
 
-def load_input(path):
+def load_input(path, pkrms=None):
     context('Opening input KMZ', detail=str(path))
     LOG.info('READ: opening KMZ %s', path)
     with zipfile.ZipFile(path) as z:
@@ -396,17 +646,15 @@ def load_input(path):
     if root.tag != q('kml'):
         raise ValueError('Expected KML 2.2 namespace.')
     bridges, ids, skipped = [], set(), 0
+    matched, unmatched = set(), []
     placemarks = root.findall('.//k:Placemark', NS)
     for pm_index, pm in enumerate(placemarks, 1):
         context('Parsing placemark', pm, detail=f'{pm_index}/{len(placemarks)}')
         LOG.info('PARSE: placemark %d/%d | %s', pm_index, len(placemarks),
                  pm.findtext('k:name', default='Unnamed', namespaces=NS))
         h = ET.HTML(pm.findtext('k:description', default='', namespaces=NS) or '<html/>')
-        if h is None:  # Whitespace/comment-only descriptions are valid non-bridge placemarks.
-            skipped += 1
-            continue
         fields = {}
-        for tr in h.xpath('//tr'):
+        for tr in (h.xpath('//tr') if h is not None else []):
             cells = tr.xpath('./td | ./th')
             if len(cells) != 2 or any(cell.xpath('.//img | .//table') for cell in cells):
                 continue
@@ -417,9 +665,25 @@ def load_input(path):
             if key in fields and fields[key] != value:
                 raise ValueError(f'Conflicting duplicate table field: {key}')
             fields[key] = value
-        if 'No. Jembatan' not in fields:
-            skipped += 1
-            continue
+        has_table = 'No. Jembatan' in fields
+        name_id, name_label = split_bridge_name(pm)
+        if not has_table:
+            if pkrms is None or name_id is None or pm.find('k:Point', NS) is None:
+                skipped += 1
+                continue
+            fields = dict.fromkeys(INVENTORY_FIELDS, '-')
+            fields.update({'No. Jembatan': name_id, 'Nama Jembatan': name_label})
+            # Preserve a raw source description before the styled popup replaces it.
+            original = pm.findtext('k:description', default='', namespaces=NS)
+            if original:
+                ex = pm.find('k:ExtendedData', NS)
+                if ex is None:
+                    ex = ET.SubElement(pm, q('ExtendedData'))
+                if ex.find('k:Data[@name="bms_original_description"]', NS) is None:
+                    data = ET.SubElement(ex, q('Data'), name='bms_original_description')
+                    set_child(data, 'value', ET.CDATA(original))
+        elif pkrms is not None and is_missing(fields['No. Jembatan']) and name_id:
+            fields['No. Jembatan'] = name_id
         if is_missing(fields['No. Jembatan']):
             name = pm.findtext('k:name', default='Unnamed placemark', namespaces=NS)
             raise ValueError(f'{name}: No. Jembatan is missing.')
@@ -427,6 +691,8 @@ def load_input(path):
         for key in REQUIRED:
             fields.setdefault(key, '-')
         ident = bridge_key(fields['No. Jembatan'])
+        if pkrms is not None and name_id and name_id != ident:
+            LOG.warning('EXCEL MATCH: popup ID %s differs from name ID %s; using the popup ID', ident, name_id)
         context('Validating bridge fields', pm, ident)
         if ident in ids:
             raise ValueError(f'Duplicate bridge ID: {ident}')
@@ -440,6 +706,38 @@ def load_input(path):
             raise ValueError(f'{ident} / Point: existing map location is missing or out of range.')
         if len(coords) == 3 and field_number(coords[2], ident, 'Point altitude') is None:
             raise ValueError(f'{ident} / Point altitude: invalid geometry; omit altitude if unavailable.')
+        authority = pm.findtext('k:ExtendedData/k:Data[@name="bms_data_authority"]/k:value',
+                                default='KMZ / tabel sumber', namespaces=NS)
+        source_record = {data.get('name')[len(PKRMS_RAW_PREFIX):]: data.findtext('k:value', default='-', namespaces=NS)
+                         for data in pm.findall('k:ExtendedData/k:Data', NS)
+                         if (data.get('name') or '').startswith(PKRMS_RAW_PREFIX)} or None
+        imported = False
+        if pkrms is not None:
+            if is_missing(fields.get('Nama Jembatan')):
+                fields['Nama Jembatan'] = name_label
+            if is_missing(fields.get('Kecamatan')):
+                fields['Kecamatan'] = district_from_kmz(pm)
+            entry = pkrms.records.get(ident)
+            if entry is not None:
+                row_number, source_record = entry
+                context('Importing PKRMS bridge fields', pm, ident,
+                        f'{pkrms.path.name} / {pkrms.sheet} / row={row_number}')
+                fields = apply_pkrms_fields(fields, source_record, ident)
+                authority = (f'PKRMS Excel: {pkrms.path.name}; {pkrms.sheet}, baris {row_number}. '
+                             'Kolom tanpa impor, lokasi dan foto: KMZ.')
+                imported = True
+                matched.add(ident)
+                LOG.info('EXCEL MATCH: %s | %s / row %d', ident, pkrms.sheet, row_number)
+            else:
+                unmatched.append(ident)
+                fields['Status PKRMS'] = 'Tidak ada pasangan; atribut KMZ dipertahankan'
+                LOG.warning('EXCEL UNMATCHED: %s | %s | existing KMZ values retained',
+                            ident, placemark_details(pm))
+            # Imported/raw bridges use KMZ geometry, never Excel coordinates.
+            # Existing unmatched tables retain all their original field values.
+            if imported or not has_table:
+                fields['Longitude'], fields['Latitude'] = coords[0].strip(), coords[1].strip()
+                fields['Sumber Koordinat'] = 'Point KMZ asli'
         lon = field_number(fields['Longitude'], ident, 'Longitude')
         lat = field_number(fields['Latitude'], ident, 'Latitude')
         if (lon is not None and not -180 <= lon <= 180) or (lat is not None and not -90 <= lat <= 90):
@@ -455,9 +753,9 @@ def load_input(path):
             if n is not None and (n < 0 or (key == 'Jumlah Bentang' and n != int(n))):
                 raise ValueError(f'{ident} / {key}: invalid value {fields[key]!r}')
         photos = []
-        for href in h.xpath('//img[not(@data-bms-logo)]/@src'):
+        context('Reading bridge photo links', pm, ident)
+        for href, member in bridge_photos(pm, h, kml_name, payload):
             context('Checking embedded photo', pm, ident, f'photo={href!r}')
-            member = photo_member(href, kml_name, payload)
             try:
                 with Image.open(io.BytesIO(payload[member])) as image:
                     image.verify()
@@ -467,10 +765,17 @@ def load_input(path):
             except (OSError, ValueError, SyntaxError, Image.DecompressionBombError) as exc:
                 raise ValueError(f'{ident} / photo {member!r}: invalid image: {exc}') from exc
             photos.append((href, member))
-        bridges.append(Bridge(pm, fields, photos))
+        bridges.append(Bridge(pm, fields, photos, authority, source_record, imported))
         LOG.info('PARSE OK: %s | %d photos checked', ident, len(photos))
     if not bridges:
-        raise ValueError('No bridge popup tables found. Expected the field No. Jembatan.')
+        raise ValueError('No bridge popup tables found. Expected No. Jembatan; '
+                         'for raw KMZ bridge Points, select Excel import or use --pkrms.')
+    if pkrms is not None:
+        unused = set(pkrms.records) - matched
+        LOG.info('EXCEL SUMMARY: %d matched; %d KMZ bridges unmatched; %d Excel records unused',
+                 len(matched), len(unmatched), len(unused))
+        if unused:
+            LOG.warning('EXCEL UNUSED: %s', ', '.join(sorted(unused)))
     return root, payload, kml_name, bridges, skipped
 
 def set_child(parent, name, value):
@@ -577,7 +882,7 @@ def write_kmz(path, root, payload, kml_name, bridges, title, logos=()):
         if len(old) not in (2, 3) or any(any(c.isspace() for c in x.strip()) for x in old):
             raise ValueError(f'{d["No. Jembatan"]}: malformed Point coordinate tuple.')
         lon, lat = number(d['Longitude']), number(d['Latitude'])
-        if lon is not None and lat is not None:
+        if lon is not None and lat is not None and not b.imported:
             new = [format(lon, 'f'), format(lat, 'f')]
             updated += int(number(old[0]) != lon or number(old[1]) != lat)
             if len(old) == 3:
@@ -598,8 +903,11 @@ def write_kmz(path, root, payload, kml_name, bridges, title, logos=()):
         values = {**d, 'STA_formatted': station(d['STA(m)']),
                   'bms_data_authority': b.authority,
                   'bms_nk_status': 'Not calculated'}
+        if b.pkrms_record is not None:
+            values.update({PKRMS_RAW_PREFIX + key: display(value) for key, value in b.pkrms_record.items()})
         for data in list(ex.findall('k:Data', NS)):
-            if data.get('name') in values or data.get('name') == 'qa_length_conflict':
+            if (data.get('name') in values or data.get('name') == 'qa_length_conflict'
+                    or (b.imported and (data.get('name') or '').startswith(PKRMS_RAW_PREFIX))):
                 ex.remove(data)
         for key, val in values.items():
             data = ET.Element(q('Data'), name=key)
@@ -840,7 +1148,9 @@ def job_paths(args):
 
 def prepare_job(args):
     source, out, targets = job_paths(args)
-    root, payload, kml_name, bridges, skipped = load_input(source)
+    pkrms_path = getattr(args, 'pkrms', None)
+    pkrms = load_pkrms_data(pkrms_path) if pkrms_path is not None else None
+    root, payload, kml_name, bridges, skipped = load_input(source, pkrms)
     title = args.title or make_title(bridges)
     return source, root, payload, kml_name, bridges, skipped, title, out, targets
 
@@ -914,8 +1224,14 @@ def execute_job(args, job):
                                                     source.name, logos)
         publish_outputs(staged, targets, args.overwrite)
     LOG.info('DONE: all outputs saved | %.1f seconds', time.monotonic() - started)
+    import_summary = ''
+    if getattr(args, 'pkrms', None) is not None:
+        matched_count = sum(b.imported for b in bridges)
+        import_summary = (f'PKRMS: {matched_count} cocok; {len(bridges)-matched_count} tanpa pasangan '
+                          '(atribut KMZ dipertahankan). Lihat rincian di terminal.\n')
     return (f'OK: {len(bridges)} jembatan; {sum(len(b.photos) for b in bridges)} foto.\n'
             f'{updated} koordinat diperbarui; {skipped} placemark non-jembatan dipertahankan.\n'
+            + import_summary
             + (f'PDF: {pages} halaman; {len(pdf_bridges)} jembatan; {len(bridges)-len(pdf_bridges)} nomor berawalan G dikecualikan.\n' if pages is not None else '')
             + '\n'.join(str(target) for target in targets))
 
@@ -931,7 +1247,26 @@ def run_gui(args):
                                             filetypes=[('KMZ', '*.kmz')])
         if not source:
             return 0
-        destination = filedialog.askdirectory(parent=win, title='2. Pilih folder penyimpanan hasil',
+        if getattr(args, 'pkrms', None) is None:
+            use_excel = messagebox.askyesnocancel(
+                'Sumber data jembatan',
+                'Impor atribut jembatan dari Excel PKRMS?\n\n'
+                'Ya: pilih Excel; nomor yang cocok memakai atribut Excel.\n'
+                'Tidak: gunakan tabel yang sudah ada di KMZ.\n'
+                'Batal: tutup tanpa membuat hasil.', parent=win)
+            if use_excel is None:
+                return 0
+            if use_excel:
+                excel = filedialog.askopenfilename(
+                    parent=win, title='2. Pilih Excel PKRMS',
+                    initialdir=str(DEFAULT_PKRMS_PATH.parent if DEFAULT_PKRMS_PATH.parent.is_dir()
+                                   else Path(source).parent),
+                    initialfile=DEFAULT_PKRMS_PATH.name,
+                    filetypes=[('PKRMS Excel', '*.xlsx')])
+                if not excel:
+                    return 0
+                args.pkrms = Path(excel)
+        destination = filedialog.askdirectory(parent=win, title='Pilih folder penyimpanan hasil',
                                               initialdir=str(Path(source).parent), mustexist=False)
         if not destination:
             return 0
@@ -945,7 +1280,7 @@ def run_gui(args):
             args.overwrite = True
         win.title('BMS - Membuat KMZ dan PDF')
         win.geometry('540x150'); win.resizable(False, False)
-        ttk.Label(win, text='Membaca data KMZ dan menyusun hasil...', padding=16).pack()
+        ttk.Label(win, text='Membaca data KMZ/Excel dan menyusun hasil...', padding=16).pack()
         progress = ttk.Progressbar(win, mode='indeterminate', length=480)
         progress.pack(padx=20, pady=8); progress.start(12)
         win.deiconify()
@@ -990,6 +1325,8 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument('input', nargs='?', help='KMZ input; omitted = Tkinter workflow')
     parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--pkrms', nargs='?', const=DEFAULT_PKRMS_PATH, type=Path,
+                        help='Import PKRMS Excel; omit the path after this flag to use the default workbook')
     parser.add_argument('--title', help='Document heading')
     parser.add_argument('--pu-logo', type=Path, default=PU_LOGO)
     parser.add_argument('--tanjabbar-logo', type=Path, default=TANJABBAR_LOGO)

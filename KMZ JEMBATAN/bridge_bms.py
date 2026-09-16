@@ -1078,7 +1078,7 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
         # All original table fields, not a fixed subset; long tables paginate.
         ordered_rows = [('No. Jembatan', d['No. Jembatan'])] + [(k, v) for k, v in d.items() if k != 'No. Jembatan']
         story += [table(ordered_rows, [width * .40, width * .60], repeat_first=True), Spacer(1, 9),
-                  p('Sumber nilai: ' + b.authority, 'small')]
+                  p('Sumber nilai: Hasil Survey Lapangan', 'small')]
         
         if not b.photos:
             story += [p('Tidak ada foto pada sumber.')]

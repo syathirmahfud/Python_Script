@@ -199,9 +199,7 @@ REQUIRED = ('No. Jembatan', 'Nama Jembatan', 'Longitude', 'Latitude',
             'STA(m)', 'Panjang(m)', 'Lebar(m)', 'Jumlah Bentang',
             'Kondisi Jembatan (Keseluruhan)')
 GENERATED_ROWS = {'Catatan asli (Description)', 'Status penilaian', 'Sumber nilai', 'STA tampilan'}
-POLICY = ('Data acuan: tabel KMZ atau Excel PKRMS; sumber dicantumkan pada setiap kartu. '
-          'Nilai tidak tersedia ditampilkan sebagai tanda hubung, bukan nol. '
-          'Catatan lama diarsipkan tanpa perbandingan panjang. NK BMS tidak dihitung.')
+POLICY = ('Data acuan: Hasil Survey Lapangan')
 MISSING = {'', '-', '–', '—', 'n/a', 'na', 'none', 'null', 'nan'}
 
 def clean_text(value):
@@ -815,7 +813,7 @@ def popup(b, title, logo_refs=()):
              f'<div style="background:{LIGHT};padding:12px"><b>STA {station(d["STA(m)"])} | '
              f'{escape(d["Panjang(m)"])} x {escape(d["Lebar(m)"])} m | {escape(d["Jumlah Bentang"])} bentang</b><br/>',
              f'<span>Kondisi: {escape(status)}</span> | NK BMS: tidak dihitung</div>',
-             '<p>Data acuan: ' + escape(b.authority) + '</p>',
+             '<p>Data acuan: Hasil Survey Lapangan</p>',
              '<h3>01 / Identitas &amp; komponen</h3><table style="width:100%;border-collapse:collapse;font-size:12px">']
     for k, v in d.items():
         parts.append(f'<tr><td style="padding:6px;border-bottom:1px solid #dce5ea;width:42%;color:{GREY}">{escape(k)}</td>'

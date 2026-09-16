@@ -997,7 +997,10 @@ def write_kmz(path, root, payload, kml_name, bridges, title, logos=()):
         styles[status] = sid
 
     set_child(doc, 'name', title)
-    
+    set_child(doc, 'description', ET.CDATA('Hijau: Baik; kuning: Sedang; jingga: Rusak Ringan; '
+                                           'merah: Rusak Berat; abu-abu: kondisi tidak tersedia/tidak dikenali. '
+                                           'Warna editorial.'))
+
     updated = 0
     for bridge_index, b in enumerate(bridges, 1):
         context('Building KMZ panel', b.pm, b.fields['No. Jembatan'])

@@ -2,7 +2,7 @@ import speedtest
 import statistics
 import time
 
-N = 100
+N = 5
 WAIT_BETWEEN = 2  # seconds
 
 latencies = []

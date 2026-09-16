@@ -1,0 +1,799 @@
+#!/usr/bin/env python3
+"""KMZ-only bridge inventory generator, version 4.3.
+Install: py -m pip install lxml Pillow reportlab pypdf
+Run: py bridge_bms.py
+Tkinter asks for the input KMZ and output folder.
+CLI: py bridge_bms.py "test.kmz" --output-dir "results"
+Options: --kmz-only --overwrite --title "Pengabuan / 2026"
+
+The verified KMZ popup table is the sole attribute source.
+Blank cells, absent optional columns, -, en/em dashes, N/A, NA, None,
+null and NaN are treated as unavailable and displayed as -; never as zero.
+STA is formatted only when available. Missing table coordinates retain
+the complete existing KMZ Point location (no mixing partial coordinate pairs).
+Malformed nonempty numbers still report the bridge ID and field.
+A bridge ID and a usable Point location remain necessary.
+Legacy notes stay archived, with no length comparisons.
+All embedded photos and timestamps are preserved. No Excel dependency.
+No engineering condition scores or code compliance are inferred.
+Inputs are never overwritten; existing outputs require confirmation.
+Supports KML 2.2, doc.kml or one KML, and two-column bridge popup tables.
+Photos must be embedded; missing or corrupt images are reported.
+Bridge numbers starting with G (case-insensitive) are excluded from the
+PDF register, cards, photos and totals, but retained in the styled KMZ.
+Condition colours: Baik green, Sedang yellow, Rusak Ringan orange,
+Rusak Berat red; unavailable or unrecognised labels grey. Labels remain intact.
+Header ignores placeholder district/year values and deduplicates whitespace/case.
+PDF: all condition highlighting appears only in the opening summary/register.
+Bridge cards and component tables use neutral styling for every condition.
+PDF includes only the first six photos per bridge, in original source order.
+Its photo total counts displayed photos; the KMZ keeps all original photos.
+PDF and KMZ popup headers include PU and Tanjabbar logos from the paths below.
+Override with --pu-logo and --tanjabbar-logo; --no-logos explicitly disables them.
+Missing or unreadable logo files produce an actionable error before output writes.
+KMZ detail panels are neutral; condition colours remain on map icons.
+"""
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+from dataclasses import dataclass
+from decimal import Decimal, InvalidOperation
+import html
+import io
+from pathlib import Path, PurePosixPath
+import re
+import sys
+import tempfile
+import logging
+import time
+from urllib.parse import unquote, urlsplit
+import zipfile
+
+try:
+    from lxml import etree as ET
+    from PIL import Image, ImageDraw
+except ImportError as exc:
+    raise SystemExit('Missing dependency. Run: py -m pip install lxml Pillow reportlab pypdf') from exc
+
+KML = 'http://www.opengis.net/kml/2.2'
+LOG = logging.getLogger('bridge_bms')
+LOG.addHandler(logging.NullHandler())
+CURRENT_CONTEXT = 'Startup'
+
+def placemark_details(pm):
+    name = pm.findtext('k:name', default='Unnamed', namespaces=NS)
+    folders = []
+    for parent in reversed(list(pm.iterancestors())):
+        if ET.QName(parent).localname in ('Folder', 'Document'):
+            label = parent.findtext('k:name', default='', namespaces=NS)
+            if label:
+                folders.append(label)
+    return f'placemark={name!r}; folder={"/".join(folders) or "(root)"}'
+
+def context(stage, pm=None, ident=None, detail=''):
+    global CURRENT_CONTEXT
+    CURRENT_CONTEXT = stage
+    if pm is not None:
+        CURRENT_CONTEXT += ' | ' + placemark_details(pm)
+    if ident is not None:
+        CURRENT_CONTEXT += f' | bridge ID={ident!r}'
+    if detail:
+        CURRENT_CONTEXT += ' | ' + detail
+
+def failure_details(exc):
+    return f'{type(exc).__name__}: {exc}\nContext: {CURRENT_CONTEXT}'
+
+def configure_logging():
+    # stderr works in PowerShell/cmd and with Tee-Object. pythonw has no console.
+    if not any(isinstance(h, logging.StreamHandler) for h in LOG.handlers):
+        stream = sys.stderr
+        if stream is not None:
+            if hasattr(stream, 'reconfigure'):
+                stream.reconfigure(errors='backslashreplace')
+            handler = logging.StreamHandler(stream)
+            handler.setFormatter(logging.Formatter('[%(asctime)s] %(levelname)s %(message)s', '%H:%M:%S'))
+            LOG.addHandler(handler)
+    LOG.setLevel(logging.INFO)
+NS = {'k': KML}
+NAVY, TEAL, AMBER, GREY, LIGHT = '#122D42', '#007E78', '#B16B00', '#526676', '#EDF3F6'
+PALETTE = {'Baik': '#00FF0D', 'Sedang': '#F9EE25',
+           'Rusak Ringan': '#FF8000', 'Rusak Berat': '#FF0000'}
+PU_LOGO = Path(r'D:\\DEV\\assets\\logo_pupr.png')
+TANJABBAR_LOGO = Path(r'D:\\DEV\\assets\\logo_TanjabBarat_2048.png')
+
+def load_logos(paths):
+    result = []
+    for path in paths:
+        try:
+            source_data = Path(path).read_bytes()
+            # Some Windows logo files have a .png extension but contain JPEG,
+            # WEBP, or another valid raster format. Normalize every readable
+            # logo to PNG for reliable ReportLab and KMZ embedding.
+            with Image.open(io.BytesIO(source_data)) as im:
+                im.load()
+                w, h = im.size
+                normalized = im.convert('RGBA')
+                buf = io.BytesIO()
+                normalized.save(buf, format='PNG', optimize=True)
+                data = buf.getvalue()
+        except (OSError, ValueError) as exc:
+            raise ValueError(f'Cannot read logo {path}: {exc}. Correct the logo path or use --no-logos.') from exc
+        result.append((data, w, h))
+    return result
+REQUIRED = ('No. Jembatan', 'Nama Jembatan', 'Longitude', 'Latitude',
+            'STA(m)', 'Panjang(m)', 'Lebar(m)', 'Jumlah Bentang',
+            'Kondisi Jembatan (Keseluruhan)')
+GENERATED_ROWS = {'Catatan asli (Description)', 'Status penilaian', 'Sumber nilai', 'STA tampilan'}
+POLICY = ('Data acuan: tabel KMZ terverifikasi menurut pemilik data. '
+          'Nilai tidak tersedia ditampilkan sebagai tanda hubung, bukan nol. '
+          'Catatan lama diarsipkan tanpa perbandingan panjang. NK BMS tidak dihitung.')
+MISSING = {'', '-', '–', '—', 'n/a', 'na', 'none', 'null', 'nan'}
+
+def is_missing(value):
+    return value is None or str(value).strip().casefold() in MISSING
+
+def bridge_key(value):
+    import unicodedata
+
+    text = str(value or '')
+    text = ''.join(
+        char for char in text
+        if unicodedata.category(char) != 'Cf'
+    )
+    return text.strip().upper()
+
+def display(value):
+    return '-' if is_missing(value) else str(value).strip()
+
+def condition_name(value):
+    normalized = re.sub(r'[\s_\-]+', ' ', str(value or '').strip()).casefold()
+    return next((k for k in PALETTE if k.casefold() == normalized), display(value))
+
+def condition_color(value):
+    return PALETTE.get(condition_name(value), GREY)
+
+def condition_ink(value):
+    return NAVY if condition_name(value) in ('Baik', 'Sedang', 'Rusak Ringan') else '#FFFFFF'
+
+def dossier_bridges(bridges):
+    return [b for b in bridges if not bridge_key(b.fields['No. Jembatan']).startswith('G')]
+
+def make_title(bridges):
+    def unique(field):
+        seen, result = set(), []
+        for b in bridges:
+            v = re.sub(r'\s+', ' ', str(b.fields.get(field) or '')).strip()
+            if not is_missing(v) and v.casefold() not in seen:
+                seen.add(v.casefold()); result.append(v)
+        return result
+    regions, years = unique('Kecamatan'), unique('Tahun Survey')
+    return ' / '.join((regions or ['Inventaris jembatan']) + years)
+
+def canonical_field(value):
+    # Ignore harmless HTML whitespace, capitalisation and trailing colons.
+    key = re.sub(r'\s+', ' ', value).strip().rstrip(':').strip()
+    lookup = {k.casefold(): k for k in (*REQUIRED, 'Kecamatan', 'Tahun Survey')}
+    lookup['tahun survei'] = 'Tahun Survey'
+    return lookup.get(key.casefold(), key)
+
+def field_number(value, ident, field):
+    try:
+        return number(value)
+    except ValueError as exc:
+        raise ValueError(f'{ident} / {field}: {exc}') from exc
+
+def q(name):
+    return '{' + KML + '}' + name
+
+def escape(value):
+    return html.escape(str(value), quote=True)
+
+def number(value):
+    if is_missing(value):
+        return None
+    s = str(value).strip().replace(',', '.')
+    try:
+        n = Decimal(s)
+    except InvalidOperation as exc:
+        raise ValueError(f'Invalid number: {value!r}') from exc
+    if not n.is_finite():
+        raise ValueError(f'Non-finite number: {value!r}')
+    return n
+
+def sta_number(value):
+    if is_missing(value):
+        return None
+    s = str(value).strip().replace(',', '.')
+    if '+' in s:
+        if not re.fullmatch(r'\d+\+\d{1,3}(?:\.\d+)?', s):
+            raise ValueError(f'Invalid station: {value!r}')
+        km, m = s.split('+')
+        return number(km) * 1000 + number(m)
+    return number(s)
+
+def station(value):
+    n = sta_number(value)
+    if n is None:
+        return '-'
+    if n < 0:
+        raise ValueError('STA must not be negative.')
+    km = int(n // 1000)
+    remainder = format(n % 1000, 'f')
+    whole, dot, fraction = remainder.partition('.')
+    fraction = fraction.rstrip('0')
+    return f'{km}+{int(whole):03d}' + ('.' + fraction if fraction else '')
+
+@dataclass
+class Bridge:
+    pm: object
+    fields: dict
+    photos: list  # (original href, ZIP member)
+    authority: str = 'KMZ Hasil Survey 2026'
+
+def photo_member(href, kml_name, names):
+    parts = urlsplit(href)
+    if parts.scheme or parts.netloc or parts.query or parts.fragment:
+        raise ValueError(f'Only embedded photo paths are supported: {href}')
+    decoded = unquote(href).replace('\\', '/')
+    p = PurePosixPath(kml_name).parent / decoded
+    if p.is_absolute() or '..' in p.parts:
+        raise ValueError(f'Unsafe photo path: {href}')
+    # Try literal paths first: a real filename can itself contain a percent sign.
+    literal = str(PurePosixPath(kml_name).parent / href)
+    for candidate in (literal, str(p)):
+        if candidate in names:
+            return candidate
+    raise ValueError(f'Missing embedded photo: {href}')
+
+def load_input(path):
+    context('Opening input KMZ', detail=str(path))
+    LOG.info('READ: opening KMZ %s', path)
+    with zipfile.ZipFile(path) as z:
+        infos = z.infolist()
+        names = [i.filename for i in infos]
+        if len(names) != len(set(names)):
+            raise ValueError('Duplicate ZIP member names; repair the input first.')
+        if sum(i.file_size for i in infos) > 1024 ** 3:
+            raise ValueError('Input exceeds the 1 GiB uncompressed safety limit.')
+        candidates = [n for n in names if n.lower().endswith('.kml')]
+        kml_name = 'doc.kml' if 'doc.kml' in names else (candidates[0] if len(candidates) == 1 else None)
+        if not kml_name:
+            raise ValueError('Expected doc.kml or exactly one KML file.')
+        payload = {}
+        for i, n in enumerate(names, 1):
+            payload[n] = z.read(n)
+            if i == 1 or i % 25 == 0 or i == len(names):
+                LOG.info('READ: archive files %d/%d', i, len(names))
+    parser = ET.XMLParser(resolve_entities=False, no_network=True)
+    root = ET.fromstring(payload[kml_name], parser)
+    if root.tag != q('kml'):
+        raise ValueError('Expected KML 2.2 namespace.')
+    bridges, ids, skipped = [], set(), 0
+    placemarks = root.findall('.//k:Placemark', NS)
+    for pm_index, pm in enumerate(placemarks, 1):
+        context('Parsing placemark', pm, detail=f'{pm_index}/{len(placemarks)}')
+        LOG.info('PARSE: placemark %d/%d | %s', pm_index, len(placemarks),
+                 pm.findtext('k:name', default='Unnamed', namespaces=NS))
+        h = ET.HTML(pm.findtext('k:description', default='', namespaces=NS) or '<html/>')
+        fields = {}
+        for tr in h.xpath('//tr'):
+            cells = tr.xpath('./td | ./th')
+            if len(cells) != 2 or any(cell.xpath('.//img | .//table') for cell in cells):
+                continue
+            key, value = [''.join(cell.itertext()).strip() for cell in cells]
+            key = canonical_field(key)
+            if not key or key in GENERATED_ROWS:
+                continue
+            if key in fields and fields[key] != value:
+                raise ValueError(f'Conflicting duplicate table field: {key}')
+            fields[key] = value
+        if 'No. Jembatan' not in fields:
+            skipped += 1
+            continue
+        if is_missing(fields['No. Jembatan']):
+            name = pm.findtext('k:name', default='Unnamed placemark', namespaces=NS)
+            raise ValueError(f'{name}: No. Jembatan is missing.')
+        fields = {k: display(v) for k, v in fields.items()}
+        for key in REQUIRED:
+            fields.setdefault(key, '-')
+        ident = bridge_key(fields['No. Jembatan'])
+        context('Validating bridge fields', pm, ident)
+        if ident in ids:
+            raise ValueError(f'Duplicate bridge ID: {ident}')
+        ids.add(ident)
+        coords = pm.findtext('k:Point/k:coordinates', default='', namespaces=NS).strip().split(',')
+        if len(coords) not in (2, 3):
+            raise ValueError(f'{ident} / Point: expected longitude,latitude[,altitude].')
+        old_lon = field_number(coords[0], ident, 'Point longitude')
+        old_lat = field_number(coords[1], ident, 'Point latitude')
+        if old_lon is None or old_lat is None or not (-180 <= old_lon <= 180 and -90 <= old_lat <= 90):
+            raise ValueError(f'{ident} / Point: existing map location is missing or out of range.')
+        if len(coords) == 3 and field_number(coords[2], ident, 'Point altitude') is None:
+            raise ValueError(f'{ident} / Point altitude: invalid geometry; omit altitude if unavailable.')
+        lon = field_number(fields['Longitude'], ident, 'Longitude')
+        lat = field_number(fields['Latitude'], ident, 'Latitude')
+        if (lon is not None and not -180 <= lon <= 180) or (lat is not None and not -90 <= lat <= 90):
+            raise ValueError(f'{ident} / Longitude, Latitude: coordinates outside valid ranges.')
+        if lon is None or lat is None:
+            fields['Sumber Koordinat'] = 'Point KMZ asli; pasangan koordinat tabel tidak lengkap'
+        try:
+            station(fields['STA(m)'])
+        except ValueError as exc:
+            raise ValueError(f'{ident} / STA(m): {exc}') from exc
+        for key in ('Panjang(m)', 'Lebar(m)', 'Jumlah Bentang'):
+            n = field_number(fields[key], ident, key)
+            if n is not None and (n < 0 or (key == 'Jumlah Bentang' and n != int(n))):
+                raise ValueError(f'{ident} / {key}: invalid value {fields[key]!r}')
+        photos = []
+        for href in h.xpath('//img[not(@data-bms-logo)]/@src'):
+            context('Checking embedded photo', pm, ident, f'photo={href!r}')
+            member = photo_member(href, kml_name, payload)
+            with Image.open(io.BytesIO(payload[member])) as image:
+                image.verify()
+            photos.append((href, member))
+        bridges.append(Bridge(pm, fields, photos))
+        LOG.info('PARSE OK: %s | %d photos checked', ident, len(photos))
+    if not bridges:
+        raise ValueError('No bridge popup tables found. Expected the field No. Jembatan.')
+    return root, payload, kml_name, bridges, skipped
+
+def set_child(parent, name, value):
+    el = parent.find('k:' + name, NS)
+    if el is None:
+        el = ET.SubElement(parent, q(name))
+    el.text = value
+    return el
+
+def order_feature(element):
+    # KML Feature common fields precede container contents / geometry.
+    rank = {'name': 0, 'visibility': 1, 'open': 2, 'Snippet': 5, 'snippet': 5,
+            'description': 6, 'LookAt': 7, 'Camera': 7, 'TimeSpan': 8, 'TimeStamp': 8,
+            'styleUrl': 9, 'Style': 10, 'StyleMap': 10, 'Region': 11,
+            'Metadata': 12, 'ExtendedData': 12, 'Schema': 13}
+    children = list(element)
+    for child in children:
+        element.remove(child)
+    for child in sorted(children, key=lambda e: rank.get(ET.QName(e).localname, 14)):
+        element.append(child)
+
+def popup(b, title, logo_refs=()):
+    d = b.fields
+    status = d['Kondisi Jembatan (Keseluruhan)']
+    logo_html = ''.join(f'<img data-bms-logo="1" src="{escape(ref)}" width="{round(w*min(42/w,48/h))}" '
+                        f'height="{round(h*min(42/w,48/h))}" style="margin:3px"/>' for ref,w,h in logo_refs)
+    parts = [f'<div style="font-family:Arial,sans-serif;width:560px;color:{NAVY}">',
+             f'<div style="background:{NAVY};color:white;padding:16px"><table width="100%"><tr><td><small style="color:#FFFFFF;">{escape(title)}</small>',
+             f'<h2 style="color:#FFFFFF;">{escape(d["Nama Jembatan"])}</h2>'
+             f'<span style="color:#FFFFFF;">{escape(d["No. Jembatan"])}</span></td>'
+             + (f'<td width="110" align="right"><div style="background:white;padding:3px">{logo_html}</div></td>' if logo_refs else '')
+             + '</tr></table></div>',
+             f'<div style="background:{LIGHT};padding:12px"><b>STA {station(d["STA(m)"])} | '
+             f'{escape(d["Panjang(m)"])} x {escape(d["Lebar(m)"])} m | {escape(d["Jumlah Bentang"])} bentang</b><br/>',
+             f'<span>Kondisi: {escape(status)}</span> | NK BMS: tidak dihitung</div>',
+             '<p>Data acuan: ' + escape(b.authority) + '</p>',
+             '<h3>01 / Identitas &amp; komponen</h3><table style="width:100%;border-collapse:collapse;font-size:12px">']
+    for k, v in d.items():
+        parts.append(f'<tr><td style="padding:6px;border-bottom:1px solid #dce5ea;width:42%;color:{GREY}">{escape(k)}</td>'
+                     f'<td style="padding:6px;border-bottom:1px solid #dce5ea">{escape(v)}</td></tr>')
+    parts.append('</table><h3>02 / Dokumentasi sumber</h3><table>')
+    for j in range(0, len(b.photos), 2):
+        parts.append('<tr>')
+        for href, member in b.photos[j:j + 2]:
+            parts.append(f'<td style="vertical-align:top;width:270px"><a href="{escape(href)}">'
+                         f'<img src="{escape(href)}" width="260"/></a><br/><small>'
+                         f'{escape(PurePosixPath(member).name)}</small></td>')
+        parts.append('</tr>')
+    parts.append('</table>')
+    if not b.photos:
+        parts.append('<p>Tidak ada foto pada sumber.</p>')
+    parts.append('<p style="font-size:11px;color:#526676">' + escape(POLICY) +
+                 ' Tata letak BMS-inspired; bukan formulir resmi.</p></div>')
+    return ''.join(parts)
+
+def write_kmz(path, root, payload, kml_name, bridges, title, logos=()):
+    LOG.info('KMZ: building %d bridge panels', len(bridges))
+    doc = root.find('k:Document', NS)
+    if doc is None:
+        raise ValueError('Expected a top-level KML Document.')
+    used_ids = set(root.xpath('//@id'))
+    prefix = 'verified_bms'
+    while any(str(i).startswith(prefix) for i in used_ids) or any(prefix in n for n in payload):
+        prefix += '_v'
+    icons, styles = {}, {}
+    logo_refs = []
+    for i,(data,w,h) in enumerate(logos):
+        href = f'{prefix}_logos/{i}.png'
+        icons[str(PurePosixPath(kml_name).parent / href)] = data
+        logo_refs.append((href,w,h))
+    for i, status in enumerate(dict.fromkeys(b.fields['Kondisi Jembatan (Keseluruhan)'] for b in bridges)):
+        sid = f'{prefix}_{i}'
+        href = f'{prefix}_icons/{i}.png'
+        member = str(PurePosixPath(kml_name).parent / href)
+        im = Image.new('RGBA', (64, 64))
+        draw = ImageDraw.Draw(im)
+        draw.ellipse((4, 4, 60, 60), fill=condition_color(status), outline='white', width=4)
+        draw.line([(15, 39), (15, 24), (49, 24), (49, 39)], fill='white', width=4)
+        draw.line([(15, 32), (49, 32)], fill='white', width=4)
+        for x in (26, 38):
+            draw.line([(x, 25), (x, 38)], fill='white', width=3)
+        buf = io.BytesIO(); im.save(buf, format='PNG'); icons[member] = buf.getvalue()
+        style = ET.SubElement(doc, q('Style'), id=sid)
+        icon_style = ET.SubElement(style, q('IconStyle'))
+        set_child(icon_style, 'scale', '1.1')
+        icon = ET.SubElement(icon_style, q('Icon')); set_child(icon, 'href', href)
+        label = ET.SubElement(style, q('LabelStyle')); set_child(label, 'scale', '0.8')
+        balloon = ET.SubElement(style, q('BalloonStyle'))
+        set_child(balloon, 'text', ET.CDATA('$[description]'))
+        styles[status] = sid
+    set_child(doc, 'name', title)
+    set_child(doc, 'description', ET.CDATA(POLICY + ' Hijau: Baik; kuning: Sedang; jingga: Rusak Ringan; merah: Rusak Berat; abu-abu: kondisi tidak tersedia/tidak dikenali. Warna editorial.'))
+    updated = 0
+    for bridge_index, b in enumerate(bridges, 1):
+        context('Building KMZ panel', b.pm, b.fields['No. Jembatan'])
+        LOG.info('KMZ: bridge %d/%d | %s', bridge_index, len(bridges), b.fields['No. Jembatan'])
+        pm, d = b.pm, b.fields
+        coords = pm.find('k:Point/k:coordinates', NS)
+        old = (coords.text or '').strip().split(',')
+        if len(old) not in (2, 3) or any(any(c.isspace() for c in x.strip()) for x in old):
+            raise ValueError(f'{d["No. Jembatan"]}: malformed Point coordinate tuple.')
+        lon, lat = number(d['Longitude']), number(d['Latitude'])
+        if lon is not None and lat is not None:
+            new = [format(lon, 'f'), format(lat, 'f')]
+            updated += int(number(old[0]) != lon or number(old[1]) != lat)
+            if len(old) == 3:
+                new.append(old[2].strip())
+            coords.text = ','.join(new)
+        # Incomplete table coordinates: leave original geometry text untouched.
+        set_child(pm, 'name', d['No. Jembatan'] + ' ' + d['Nama Jembatan'])
+        set_child(pm, 'description', ET.CDATA(popup(b, title, logo_refs)))
+        set_child(pm, 'styleUrl', '#' + styles[d['Kondisi Jembatan (Keseluruhan)']])
+        # Inline IconStyle/BalloonStyle would override the shared design.
+        for inline in pm.findall('k:Style', NS):
+            for child in list(inline):
+                if child.tag in (q('IconStyle'), q('BalloonStyle')):
+                    inline.remove(child)
+        ex = pm.find('k:ExtendedData', NS)
+        if ex is None:
+            ex = ET.SubElement(pm, q('ExtendedData'))
+        values = {**d, 'STA_formatted': station(d['STA(m)']),
+                  'bms_data_authority': b.authority,
+                  'bms_nk_status': 'Not calculated'}
+        for data in list(ex.findall('k:Data', NS)):
+            if data.get('name') in values or data.get('name') == 'qa_length_conflict':
+                ex.remove(data)
+        for key, val in values.items():
+            data = ET.Element(q('Data'), name=key)
+            set_child(data, 'value', val)
+            ex.insert(len(ex.findall('k:Data', NS)), data)
+        order_feature(pm)
+    order_feature(doc)
+    LOG.info('KMZ: compressing archive')
+    context('Compressing KMZ archive', detail=str(path))
+    with zipfile.ZipFile(path, 'w', zipfile.ZIP_DEFLATED) as dest:
+        for name, data in payload.items():
+            dest.writestr(name, ET.tostring(root, xml_declaration=True, encoding='UTF-8') if name == kml_name else data)
+        for name, data in icons.items():
+            dest.writestr(name, data)
+    LOG.info('KMZ: checking CRC and embedded-file preservation')
+    context('Validating KMZ archive', detail=str(path))
+    with zipfile.ZipFile(path) as check:
+        if check.testzip():
+            raise ValueError('Output KMZ failed CRC validation.')
+        for name, data in payload.items():
+            if name != kml_name and check.read(name) != data:
+                raise ValueError(f'Embedded file changed unexpectedly: {name}')
+    return updated
+
+def write_pdf(path, bridges, payload, title, source, logos=()):
+    bridges = dossier_bridges(bridges)
+    LOG.info('PDF: preparing %d bridges after G-prefix filtering', len(bridges))
+    from reportlab.lib import colors
+    from reportlab.lib.enums import TA_LEFT
+    from reportlab.lib.pagesizes import A4
+    from reportlab.lib.styles import ParagraphStyle
+    from reportlab.platypus import (SimpleDocTemplate, Paragraph, Spacer, Table,
+                                   TableStyle, Image as RLImage, PageBreak, KeepTogether)
+    from pypdf import PdfReader
+    from reportlab.lib.utils import ImageReader
+    width = A4[0] - 72
+    styles = {name: ParagraphStyle(name, fontName='Helvetica-Bold' if bold else 'Helvetica',
+                                   fontSize=size, leading=size * 1.35, textColor=colors.HexColor(color),
+                                   spaceAfter=6, splitLongWords=True, alignment=TA_LEFT)
+              for name, size, bold, color in [('body', 9, False, NAVY), ('small', 7, False, GREY),
+                                               ('heading', 17, True, NAVY), ('section', 11, True, NAVY),
+                                               ('white', 10, True, '#FFFFFF')]}
+    def p(value, style='body'):
+        return Paragraph(escape(value), styles[style])
+    def table(rows, widths, header=False, repeat_first=False):
+        cells = [[p(v, 'white' if header and i == 0 else 'body') for v in row] for i, row in enumerate(rows)]
+        condition_cells = []
+        for i, row in enumerate(rows):
+            if header and i == 0:
+                continue
+            col = (1 if len(row) == 2 and 'kondisi' in str(row[0]).casefold()
+                   else 5 if len(row) == 6
+                   else 4 if len(row) == 5 else None)
+            if col is not None:
+                value = row[col]
+                if len(row) == 2:
+                    continue
+                cells[i][col] = Paragraph(escape(value), ParagraphStyle('condition',fontName='Helvetica',
+                    fontSize=9,leading=12,textColor=colors.HexColor(condition_ink(value))))
+                condition_cells.append(('BACKGROUND',(col,i),(col,i),colors.HexColor(condition_color(value))))
+        t = Table(cells, colWidths=widths, repeatRows=1 if header or repeat_first else 0, hAlign='LEFT')
+        commands = [('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                    ('LEFTPADDING', (0, 0), (-1, -1), 7), ('RIGHTPADDING', (0, 0), (-1, -1), 7),
+                    ('TOPPADDING', (0, 0), (-1, -1), 4), ('BOTTOMPADDING', (0, 0), (-1, -1), 4),
+                    ('ROWBACKGROUNDS', (0, 0), (-1, -1), [colors.HexColor(LIGHT), colors.white])]
+        if header:
+            commands.append(('BACKGROUND', (0, 0), (-1, 0), colors.HexColor(NAVY)))
+        commands.extend(condition_cells)
+        t.setStyle(TableStyle(commands))
+        return t
+    def photograph(member, max_width, max_height):
+        with Image.open(io.BytesIO(payload[member])) as im:
+            iw, ih = im.size
+        scale = min(max_width / iw, max_height / ih)
+        return RLImage(io.BytesIO(payload[member]), width=iw * scale, height=ih * scale)
+    def page_decoration(c, doc):
+        context('Rendering PDF', detail=f'page={doc.page}; see preceding PDF PREPARE logs for bridge details')
+        LOG.info('PDF RENDER: page %d', doc.page)
+        c.saveState()
+        c.setFillColor(colors.HexColor(NAVY)); c.rect(0, A4[1] - 84, A4[0], 84, fill=1, stroke=0)
+        heading = Paragraph(escape(title.upper()), ParagraphStyle('header', fontName='Helvetica-Bold',
+                            fontSize=10, leading=12, textColor=colors.HexColor('#73CCC0')))
+        text_width = width - (110 if logos else 0)
+        _, hh = heading.wrap(text_width, 26)
+        if hh > 26:
+            raise ValueError('Title too long; shorten --title.')
+        heading.drawOn(c, 36, A4[1] - 18 - hh)
+        font_size = min(21, 21*text_width/c.stringWidth('Dossier inventaris jembatan','Helvetica-Bold',21))
+        c.setFillColor(colors.white); c.setFont('Helvetica-Bold', font_size)
+        c.drawString(36, A4[1] - 65, 'Dossier inventaris jembatan')
+        if logos:
+            x = A4[0] - 36 - 100
+            c.setFillColor(colors.white); c.roundRect(x, A4[1]-68, 100, 52, 3, fill=1, stroke=0)
+            for i,(data,w,h) in enumerate(logos):
+                scale = min(42/w,44/h)
+                c.drawImage(ImageReader(io.BytesIO(data)),x+4+i*48+(42-w*scale)/2,
+                            A4[1]-64+(44-h*scale)/2,w*scale,h*scale,mask='auto')
+        c.setStrokeColor(colors.HexColor('#D7E1E7')); c.line(36, 38, A4[0] - 36, 38)
+        c.setFillColor(colors.HexColor(GREY)); c.setFont('Helvetica', 7)
+        c.drawString(36, 24, 'INVENTARIS | BMS-inspired | Sumber data dicantumkan pada kartu')
+        c.drawRightString(A4[0] - 36, 24, f'{doc.page:02d}')
+        c.restoreState()
+    counts = Counter(condition_name(b.fields['Kondisi Jembatan (Keseluruhan)']) for b in bridges)
+    stat_style = ParagraphStyle('stat', fontName='Helvetica-Bold', fontSize=36, leading=42,
+                                textColor=colors.HexColor(NAVY))
+    stats = Table([[Paragraph(f'{len(bridges):02d}', stat_style), p('jembatan'),
+                    Paragraph(f'{sum(min(6, len(b.photos)) for b in bridges):02d}', stat_style), p('foto ditampilkan')]],
+                  colWidths=[75, width/2-75, 85, width/2-85], hAlign='LEFT')
+    stats.setStyle(TableStyle([('VALIGN',(0,0),(-1,-1),'MIDDLE'),
+                              ('LEFTPADDING',(0,0),(-1,-1),0), ('BOTTOMPADDING',(0,0),(-1,-1),12)]))
+    legend_cells = []
+    for label, color in PALETTE.items():
+        legend_cells.append(Paragraph(escape(f'{label}: {counts.get(label, 0)}'),
+            ParagraphStyle('legend', fontName='Helvetica-Bold', fontSize=8, leading=11,
+                           textColor=colors.HexColor(condition_ink(label)))))
+    legend = Table([legend_cells], colWidths=[width/4]*4, hAlign='LEFT')
+    legend.setStyle(TableStyle([('BACKGROUND',(i,0),(i,0),colors.HexColor(col))
+                               for i,col in enumerate(PALETTE.values())] +
+                              [('TOPPADDING',(0,0),(-1,-1),7),('BOTTOMPADDING',(0,0),(-1,-1),7)]))
+    story = [stats, legend, Spacer(1, 12), p('Sumber: ' + source),
+             p(' | '.join(f'{k}: {v}' for k,v in counts.items() if k not in PALETTE), 'small'),
+             Spacer(1, 10), p('01 / Register jembatan', 'section')]
+    rows = [['No.', 'No. Jembatan', 'Nama jembatan', 'STA', 'P (m)', 'Kondisi']]
+    rows.extend([str(i), bridge_key(b.fields['No. Jembatan']), b.fields['Nama Jembatan'], station(b.fields['STA(m)']),
+                 b.fields['Panjang(m)'], b.fields['Kondisi Jembatan (Keseluruhan)']]
+                for i, b in enumerate(bridges, 1))
+    register = table(rows, [32, 125, width - 352, 65, 45, 85], True)
+    story += [register, Spacer(1, 15),
+              p('02 / Dasar data', 'section'), p(POLICY),
+              p('PDF untuk laporan dan pencetakan; KMZ untuk peta, atribut, dan foto. '
+                'Koordinat tabel dipakai jika lengkap; jika tidak, lokasi Point KMZ dipertahankan. Ketinggian dan timestamp tetap.'),
+              p('Format ini tidak menyatakan kapasitas struktur atau keamanan operasional. '
+                'Kode kerusakan, skor NK dan rekomendasi penanganan tidak disimpulkan dari foto.')]
+    if bridges:
+        story.append(PageBreak())
+    else:
+        story.append(p('Tidak ada jembatan untuk dossier setelah filter nomor berawalan G.'))
+    for i, b in enumerate(bridges, 1):
+        d = b.fields
+        context('Preparing PDF bridge card', b.pm, d['No. Jembatan'])
+        LOG.info('PDF PREPARE: bridge %d/%d | %s | %s', i, len(bridges), d['No. Jembatan'], d['Nama Jembatan'])
+        status = d['Kondisi Jembatan (Keseluruhan)']
+        story += [p(f'{i:02d} / Kartu inventaris', 'section'), p(d['Nama Jembatan'], 'heading'),
+                  p(d['No. Jembatan'] + ' | STA ' + station(d['STA(m)']))]
+        band_text = Paragraph(escape('KONDISI: ' + status.upper() + ' / NK BMS: TIDAK DIHITUNG'),
+            ParagraphStyle('band',fontName='Helvetica-Bold',fontSize=10,leading=14,
+                           textColor=colors.HexColor(NAVY)))
+        band = Table([[band_text]], colWidths=[width])
+        band.setStyle(TableStyle([('BACKGROUND', (0, 0), (-1, -1), colors.HexColor(LIGHT)),
+                                 ('LEFTPADDING', (0, 0), (-1, -1), 9), ('TOPPADDING', (0, 0), (-1, -1), 7)]))
+        story += [band, Spacer(1, 8)]
+        # All original table fields, not a fixed subset; long tables paginate.
+        ordered_rows = [('No. Jembatan', d['No. Jembatan'])] + [(k, v) for k, v in d.items() if k != 'No. Jembatan']
+        story += [table(ordered_rows, [width * .40, width * .60], repeat_first=True), Spacer(1, 9),
+                  p('Sumber nilai: ' + b.authority, 'small')]
+        
+        if not b.photos:
+            story += [p('Tidak ada foto pada sumber.')]
+        shown_photos = b.photos[:6]
+        for offset in range(0, len(shown_photos), 6):
+            story += [PageBreak(), p(f'{i:02d} / Dokumentasi foto', 'section'), p(d['Nama Jembatan'], 'heading'),
+                      p(d['No. Jembatan'] + f' | Foto 1-{len(shown_photos)} ditampilkan dari {len(b.photos)} foto sumber', 'small')]
+            chunk = shown_photos[offset:offset + 6]
+            for j in range(0, len(chunk), 2):
+                cells = []
+                for k, (_, member) in enumerate(chunk[j:j + 2]):
+                    context('Preparing PDF photo', b.pm, d['No. Jembatan'], f'photo={member!r}')
+                    LOG.info('PDF PHOTO: %s | %d/%d | %s', d['No. Jembatan'],
+                             offset+j+k+1, len(shown_photos), member)
+                    cells.append([photograph(member, (width - 24) / 2, 155), Spacer(1, 3),
+                                  p(f'{offset+j+k+1:02d} / {PurePosixPath(member).name}', 'small')])
+                if len(cells) == 1:
+                    cells.append('')
+                t = Table([cells], colWidths=[width / 2] * 2, hAlign='LEFT')
+                t.setStyle(TableStyle([('VALIGN', (0, 0), (-1, -1), 'TOP'),
+                                      ('LEFTPADDING', (0, 0), (-1, -1), 0),
+                                      ('BOTTOMPADDING', (0, 0), (-1, -1), 12)]))
+                story.append(t)
+            story.append(p('Foto dan urutan mengikuti sumber. Arah foto dan kode kerusakan tidak direkayasa.', 'small'))
+        if i != len(bridges):
+            story.append(PageBreak())
+    doc = SimpleDocTemplate(str(path), pagesize=A4, leftMargin=36, rightMargin=36,
+                            topMargin=105, bottomMargin=52, title=title, author='Diolah dari ' + source)
+    LOG.info('PDF: rendering document (final page count not known yet)')
+    doc.build(story, onFirstPage=page_decoration, onLaterPages=page_decoration)
+    reader = PdfReader(str(path))
+    extracted = []
+    for page_index, page in enumerate(reader.pages, 1):
+        context('Extracting PDF text', detail=f'page={page_index}')
+        LOG.info('PDF VALIDATE: extracting page %d/%d', page_index, len(reader.pages))
+        extracted.append(page.extract_text() or '')
+    content = '\n'.join(extracted)
+    failures = []
+    for i, b in enumerate(bridges, 1):
+        ident = b.fields['No. Jembatan']
+        context('Validating PDF bridge ID', b.pm, ident)
+        if ident not in content:
+            failures.append(f'bridge ID={ident!r}; '+placemark_details(b.pm))
+            LOG.error('PDF VALIDATE: ID not found verbatim | %r | %s', ident, b.fields['Nama Jembatan'])
+        else:
+            LOG.info('PDF VALIDATE: bridge %d/%d OK | %s', i, len(bridges), ident)
+    if failures:
+        raise ValueError('PDF validation failed: missing bridge ID(s) in extracted text: '
+                         + '\n' + '\n'.join(failures)
+                         + '. This can be a text wrapping/font extraction issue; see terminal diagnostics.')
+    LOG.info('PDF: validation passed | %d pages', len(reader.pages))
+    return len(reader.pages)
+
+def prepare_job(args):
+    source = Path(args.input).expanduser().resolve()
+    if not source.is_file():
+        raise ValueError(f'Input file not found: {source}')
+    root, payload, kml_name, bridges, skipped = load_input(source)
+    title = args.title or make_title(bridges)
+    out = (args.output_dir or source.parent / (source.stem + '_bms_output')).resolve()
+    targets = [out / (source.stem + '_BMS.kmz')]
+    if not args.kmz_only:
+        targets.append(out / (source.stem + '_Dossier.pdf'))
+    for target in targets:
+        if target.resolve() == source:
+            raise ValueError('Refusing to overwrite input.')
+    return source, root, payload, kml_name, bridges, skipped, title, out, targets
+
+def execute_job(args, job):
+    started = time.monotonic()
+    source, root, payload, kml_name, bridges, skipped, title, out, targets = job
+    LOG.info('ASSETS: loading header logos%s', ' (disabled)' if args.no_logos else '')
+    context('Loading header logos')
+    logos = [] if args.no_logos else load_logos([args.pu_logo, args.tanjabbar_logo])
+    for target in targets:
+        if target.exists() and not args.overwrite:
+            raise ValueError(f'Output exists: {target}. Use another --output-dir or --overwrite.')
+    out.mkdir(parents=True, exist_ok=True)
+    # Build and validate in staging before publishing final files.
+    with tempfile.TemporaryDirectory(prefix='bridge_bms_', dir=out) as tmp:
+        staged = [Path(tmp) / target.name for target in targets]
+        updated = write_kmz(staged[0], root, payload, kml_name, bridges, title, logos)
+        pdf_bridges = dossier_bridges(bridges)
+        pdf_title = args.title or make_title(pdf_bridges)
+        pages = None if args.kmz_only else write_pdf(staged[1], pdf_bridges, payload, pdf_title,
+                                                    source.name, logos)
+        for temporary, target in zip(staged, targets):
+            context('Saving validated output', detail=str(target))
+            LOG.info('SAVE: %s', target)
+            temporary.replace(target)
+    LOG.info('DONE: all outputs saved | %.1f seconds', time.monotonic() - started)
+    return (f'OK: {len(bridges)} jembatan; {sum(len(b.photos) for b in bridges)} foto.\n'
+            f'{updated} koordinat diperbarui; {skipped} placemark non-jembatan dipertahankan.\n'
+            + (f'PDF: {pages} halaman; {len(pdf_bridges)} jembatan; {len(bridges)-len(pdf_bridges)} nomor berawalan G dikecualikan.\n' if pages is not None else '')
+            + '\n'.join(str(target) for target in targets))
+
+def run_gui(args):
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    import queue
+    import threading
+    win = tk.Tk(); win.withdraw()
+    try:
+        source = filedialog.askopenfilename(parent=win, title='1. Pilih file KMZ jembatan',
+                                            filetypes=[('KMZ', '*.kmz')])
+        if not source:
+            return 0
+        destination = filedialog.askdirectory(parent=win, title='2. Pilih folder penyimpanan hasil',
+                                              initialdir=str(Path(source).parent), mustexist=False)
+        if not destination:
+            return 0
+        args.input, args.output_dir = source, Path(destination)
+        job = prepare_job(args)
+        targets = job[8]
+        existing = [p for p in targets if p.exists()]
+        if existing and not args.overwrite:
+            if not messagebox.askyesno('Hasil sudah ada', 'Ganti file hasil berikut?\n' +
+                                      '\n'.join(str(p) for p in existing), parent=win):
+                return 0
+            args.overwrite = True
+        win.title('BMS - Membuat KMZ dan PDF')
+        win.geometry('540x150'); win.resizable(False, False)
+        ttk.Label(win, text='Membaca data KMZ dan menyusun hasil...', padding=16).pack()
+        progress = ttk.Progressbar(win, mode='indeterminate', length=480)
+        progress.pack(padx=20, pady=8); progress.start(12)
+        win.deiconify()
+        results = queue.Queue()
+        def worker():
+            try:
+                results.put((True, execute_job(args, job)))
+            except Exception as exc:
+                LOG.exception('FAILED: %s', failure_details(exc))
+                results.put((False, failure_details(exc)))
+        def poll():
+            try:
+                ok, result = results.get_nowait()
+            except queue.Empty:
+                win.after(100, poll)
+                return
+            progress.stop(); win.withdraw()
+            if ok:
+                messagebox.showinfo('Selesai', result, parent=win)
+            else:
+                messagebox.showerror('Gagal membuat hasil', result, parent=win)
+            win.quit()
+        # Do not terminate halfway through writing if the progress window closes.
+        win.protocol('WM_DELETE_WINDOW', lambda: None)
+        threading.Thread(target=worker, daemon=True).start()
+        win.after(100, poll); win.mainloop()
+    except Exception as exc:
+        LOG.exception('FAILED: %s', failure_details(exc))
+        messagebox.showerror('Gagal', failure_details(exc), parent=win)
+        return 1
+    finally:
+        win.destroy()
+    return 0
+
+def main(argv=None):
+    configure_logging()
+    LOG.info('START: bridge_bms terminal progress enabled')
+    parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument('input', nargs='?', help='KMZ input; omitted = Tkinter workflow')
+    parser.add_argument('--output-dir', type=Path)
+    parser.add_argument('--title', help='Document heading')
+    parser.add_argument('--pu-logo', type=Path, default=PU_LOGO)
+    parser.add_argument('--tanjabbar-logo', type=Path, default=TANJABBAR_LOGO)
+    parser.add_argument('--no-logos', action='store_true', help='Explicitly generate without header logos')
+    parser.add_argument('--kmz-only', action='store_true')
+    parser.add_argument('--overwrite', action='store_true')
+    args = parser.parse_args(argv)
+    if not args.input:
+        return run_gui(args)
+    print(execute_job(args, prepare_job(args)))
+    return 0
+
+if __name__ == '__main__':
+    try:
+        sys.exit(main())
+    except (ValueError, OSError, zipfile.BadZipFile, ET.XMLSyntaxError) as exc:
+        LOG.exception('FAILED: %s', failure_details(exc))
+        sys.exit(1)

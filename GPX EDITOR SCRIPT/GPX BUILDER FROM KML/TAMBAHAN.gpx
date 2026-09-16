@@ -1,0 +1,120 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="kml_to_gpx.py" xmlns="http://www.topografix.com/GPX/1/1" xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xsi:schemaLocation="http://www.topografix.com/GPX/1/1 http://www.topografix.com/GPX/1/1/gpx.xsd">
+  <trk>
+    <n>Converted Track</n>
+    <trkseg>
+        <trkpt lat="-1.0471687" lon="103.3381399">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:32Z</time>
+        </trkpt>
+        <trkpt lat="-1.0473688" lon="103.3380061">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:36Z</time>
+        </trkpt>
+        <trkpt lat="-1.0474861" lon="103.3379342">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:40Z</time>
+        </trkpt>
+        <trkpt lat="-1.0475838" lon="103.3378722">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:44Z</time>
+        </trkpt>
+        <trkpt lat="-1.0476882" lon="103.3378000">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:48Z</time>
+        </trkpt>
+        <trkpt lat="-1.0478297" lon="103.3377055">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:52Z</time>
+        </trkpt>
+        <trkpt lat="-1.0479353" lon="103.3376388">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:44:56Z</time>
+        </trkpt>
+        <trkpt lat="-1.0481135" lon="103.3375080">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:00Z</time>
+        </trkpt>
+        <trkpt lat="-1.0481923" lon="103.3374557">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:04Z</time>
+        </trkpt>
+        <trkpt lat="-1.0483111" lon="103.3373756">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:08Z</time>
+        </trkpt>
+        <trkpt lat="-1.0484038" lon="103.3373151">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:12Z</time>
+        </trkpt>
+        <trkpt lat="-1.0485107" lon="103.3372447">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:16Z</time>
+        </trkpt>
+        <trkpt lat="-1.0486160" lon="103.3371772">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:20Z</time>
+        </trkpt>
+        <trkpt lat="-1.0487001" lon="103.3371181">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:24Z</time>
+        </trkpt>
+        <trkpt lat="-1.0488279" lon="103.3370295">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:28Z</time>
+        </trkpt>
+        <trkpt lat="-1.0489288" lon="103.3369523">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:32Z</time>
+        </trkpt>
+        <trkpt lat="-1.0490359" lon="103.3368826">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:36Z</time>
+        </trkpt>
+        <trkpt lat="-1.0491188" lon="103.3368227">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:40Z</time>
+        </trkpt>
+        <trkpt lat="-1.0492070" lon="103.3367604">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:44Z</time>
+        </trkpt>
+        <trkpt lat="-1.0492966" lon="103.3366997">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:48Z</time>
+        </trkpt>
+        <trkpt lat="-1.0493940" lon="103.3366394">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:52Z</time>
+        </trkpt>
+        <trkpt lat="-1.0494748" lon="103.3365896">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:45:56Z</time>
+        </trkpt>
+        <trkpt lat="-1.0496023" lon="103.3365000">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:46:00Z</time>
+        </trkpt>
+        <trkpt lat="-1.0496675" lon="103.3364535">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:46:04Z</time>
+        </trkpt>
+        <trkpt lat="-1.0497434" lon="103.3364032">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:46:08Z</time>
+        </trkpt>
+        <trkpt lat="-1.0498080" lon="103.3363587">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:46:12Z</time>
+        </trkpt>
+        <trkpt lat="-1.0498804" lon="103.3363159">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:46:16Z</time>
+        </trkpt>
+        <trkpt lat="-1.0499647" lon="103.3362672">
+          <ele>0.00</ele>
+          <time>2026-07-27T02:46:20Z</time>
+        </trkpt>
+    </trkseg>
+  </trk>
+</gpx>

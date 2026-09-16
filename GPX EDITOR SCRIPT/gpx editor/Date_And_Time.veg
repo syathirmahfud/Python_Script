@@ -1,0 +1,51 @@
+{
+	"components" : 
+	[
+		{
+			"colorStyle" : "background",
+			"frame" : 
+			{
+				"height" : 40,
+				"width" : 275,
+				"x" : 0,
+				"y" : 0
+			},
+			"imagePath" : "images/SML_LongBox_BGv2.png",
+			"type" : "image"
+		},
+		{
+			"autoTextType" : "labelValueUnit",
+			"colorStyle" : "autoForeground",
+			"fontFamily" : "Arial Italic",
+			"fontSize" : 20,
+			"frame" : 
+			{
+				"height" : 0,
+				"width" : 0,
+				"x" : 18,
+				"y" : 36
+			},
+			"horizontalAlign" : "left",
+			"type" : "text",
+			"valuePrecision" : 0,
+			"verticalAlign" : "bottom"
+		}
+	],
+	"frame" : 
+	{
+		"height" : 40,
+		"width" : 275,
+		"x" : 0,
+		"y" : 0
+	},
+	"type" : "group",
+	"unlisted" : false,
+	"unsupportedTypes" : 
+	[
+		"temperature",
+		"gForceLatLon",
+		"gForceLatVert",
+		"gForceLonVert",
+		"dateAndTime"
+	]
+}

@@ -16,6 +16,9 @@ Malformed nonempty numbers still report the bridge ID and field.
 A bridge ID and a usable Point location remain necessary.
 Legacy notes stay archived, with no length comparisons.
 All embedded photos and timestamps are preserved. No Excel dependency.
+Output photo filenames use "<bridge number> - (n)<original extension>",
+starting at 1 for each bridge. Popup and archived photo links are updated.
+Photo bytes, source order and the original input KMZ remain unchanged.
 No engineering condition scores or code compliance are inferred.
 Inputs are never overwritten; existing outputs require confirmation.
 Failed saves restore earlier outputs; any failed recovery reports its backup folder.
@@ -50,6 +53,7 @@ import html
 import io
 from math import ceil
 from pathlib import Path, PurePosixPath
+import posixpath
 import re
 import shutil
 import sys
@@ -57,7 +61,7 @@ import tempfile
 import logging
 import time
 import unicodedata
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 import zipfile
 
 try:
@@ -248,7 +252,7 @@ def station(value):
 class Bridge:
     pm: object
     fields: dict
-    photos: list  # (original href, ZIP member)
+    photos: list  # (current href, ZIP member), in original source order
     authority: str = 'KMZ Hasil Survey 2026'
 
 def photo_member(href, kml_name, names):
@@ -265,6 +269,108 @@ def photo_member(href, kml_name, names):
         if candidate in names:
             return candidate
     raise ValueError(f'Missing embedded photo: {href}')
+
+def rename_bridge_photos(root, payload, kml_name, bridges):
+    """Rename output photos and their links without re-encoding image bytes."""
+    sources = {member for b in bridges for _, member in b.photos}
+    if not sources:
+        return dict(payload)
+    occupied = {name.casefold() for name in payload if name not in sources}
+    renamed, global_map, plans = {}, {}, []
+    for b in bridges:
+        ident = bridge_key(b.fields['No. Jembatan'])
+        stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', ident).strip(' .')
+        context('Naming bridge photos', b.pm, ident)
+        if b.photos and (not stem or len(stem) > 180):
+            raise ValueError(f'{ident!r}: bridge number cannot form a usable photo filename.')
+        owner_map, photos = {}, []
+        for index, (_, member) in enumerate(b.photos, 1):
+            old = PurePosixPath(member)
+            extension = old.suffix
+            if not re.fullmatch(r'\.[A-Za-z0-9]{1,8}', extension):
+                with Image.open(io.BytesIO(payload[member])) as im:
+                    extension = next((ext for ext, fmt in Image.registered_extensions().items()
+                                      if fmt == im.format), None)
+                if extension is None:
+                    raise ValueError(f'{ident} / photo {member!r}: cannot determine an image extension.')
+            target = str(old.with_name(f'{stem} - ({index}){extension}'))
+            if target.casefold() in occupied:
+                raise ValueError(f'{ident} / photo {member!r}: output filename collision: {target}')
+            occupied.add(target.casefold())
+            renamed[target] = payload[member]
+            # Shared images get a separate filename for each bridge/occurrence.
+            # Other references to a shared source use its first matching copy.
+            owner_map.setdefault(member, target)
+            global_map.setdefault(member, target)
+            href = quote(posixpath.relpath(target, str(PurePosixPath(kml_name).parent)), safe='/()-._')
+            photos.append((href, target))
+            LOG.info('PHOTO NAME: %s | %d/%d | %s -> %s', ident, index, len(b.photos), member, target)
+        plans.append((b, photos, owner_map))
+
+    def rewrite_tree(tree, document_name, scoped=False):
+        changed = False
+        owners = {b.pm: {**global_map, **mapping} for b, _, mapping in plans} if scoped else {}
+        for element in tree.iter():
+            if not isinstance(element.tag, str):
+                continue
+            mapping = global_map
+            if scoped:
+                owner = next((ancestor for ancestor in element.iterancestors()
+                              if ancestor in owners), None)
+                mapping = owners.get(element, owners.get(owner, global_map))
+            def reference(value):
+                decoded = html.unescape(value).strip()
+                try:
+                    parts = urlsplit(decoded)
+                except ValueError:
+                    return None  # Unrelated prose is not necessarily a valid URI.
+                if parts.scheme or parts.netloc or parts.query or parts.fragment:
+                    return None
+                parent = str(PurePosixPath(document_name).parent)
+                # Match literal percent signs first, just as photo_member does.
+                for ref in (decoded, unquote(decoded)):
+                    member = posixpath.normpath(posixpath.join(parent, ref.replace('\\', '/')))
+                    if member in mapping:
+                        return quote(posixpath.relpath(mapping[member], parent), safe='/()-._')
+                return None
+            def replace_links(value):
+                direct = reference(value)
+                if direct is not None:
+                    return direct
+                # Preserve HTML fragments (including pdfmaps_photos) verbatim
+                # except for src/href values; accept quoted and unquoted URLs.
+                def attribute(match):
+                    url = next(v for v in match.groups()[1:] if v is not None)
+                    new = reference(url)
+                    return match.group(0) if new is None else match.group(1) + '"' + escape(new) + '"'
+                return re.sub(r'''(\b(?:src|href)\s*=\s*)(?:"([^"]*)"|'([^']*)'|([^\s<>"']+))''',
+                              attribute, value, flags=re.IGNORECASE)
+            if element.text:
+                new = replace_links(element.text)
+                if new != element.text:
+                    element.text = ET.CDATA(new) if '<' in new else new
+                    changed = True
+            for attr, value in list(element.attrib.items()):
+                if ET.QName(attr).localname in ('href', 'src'):
+                    new = reference(value)
+                    if new is not None and new != value:
+                        element.set(attr, new)
+                        changed = True
+        return changed
+
+    result = {name: data for name, data in payload.items() if name not in sources}
+    result.update(renamed)
+    rewrite_tree(root, kml_name, scoped=True)
+    for name, data in payload.items():
+        if name != kml_name and name.lower().endswith('.kml'):
+            context('Updating embedded KML photo links', detail=name)
+            tree = ET.fromstring(data, ET.XMLParser(resolve_entities=False, no_network=True))
+            if rewrite_tree(tree, name):
+                result[name] = ET.tostring(tree, xml_declaration=True, encoding='UTF-8')
+    for b, photos, _ in plans:
+        b.photos = photos
+    LOG.info('PHOTO NAME: %d photo entries named across %d bridges', len(renamed), len(bridges))
+    return result
 
 def load_input(path):
     context('Opening input KMZ', detail=str(path))
@@ -800,6 +906,7 @@ def execute_job(args, job):
     # Build and validate in staging before publishing final files.
     with tempfile.TemporaryDirectory(prefix='bridge_bms_', dir=out) as tmp:
         staged = [Path(tmp) / target.name for target in targets]
+        payload = rename_bridge_photos(root, payload, kml_name, bridges)
         updated = write_kmz(staged[0], root, payload, kml_name, bridges, title, logos)
         pdf_bridges = dossier_bridges(bridges)
         pdf_title = args.title or make_title(pdf_bridges)

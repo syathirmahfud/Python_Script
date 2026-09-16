@@ -1023,7 +1023,7 @@ def write_pdf(path, bridges, payload, title, source, logos=()):
                             A4[1]-64+(44-h*scale)/2,w*scale,h*scale,mask='auto')
         c.setStrokeColor(colors.HexColor('#D7E1E7')); c.line(36, 38, A4[0] - 36, 38)
         c.setFillColor(colors.HexColor(GREY)); c.setFont('Helvetica', 7)
-        c.drawString(36, 24, 'INVENTARIS | BMS-inspired | Sumber data dicantumkan pada kartu')
+        c.drawString(36, 24, 'Survey Kondisi Jembatan Kabupaten Tanjung Jabung Barat 2026')
         c.drawRightString(A4[0] - 36, 24, f'{doc.page:02d}')
         c.restoreState()
     counts = Counter(condition_name(b.fields['Kondisi Jembatan (Keseluruhan)']) for b in bridges)

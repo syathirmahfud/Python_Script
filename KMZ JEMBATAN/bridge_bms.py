@@ -501,7 +501,7 @@ class Bridge:
     pm: object
     fields: dict
     photos: list  # (current href, ZIP member), in original source order
-    authority: str = 'KMZ / tabel sumber'
+    authority: str = 'Hasil Survey Lapangan'
     pkrms_record: dict | None = None
     imported: bool = False
 
@@ -707,7 +707,7 @@ def load_input(path, pkrms=None):
         if len(coords) == 3 and field_number(coords[2], ident, 'Point altitude') is None:
             raise ValueError(f'{ident} / Point altitude: invalid geometry; omit altitude if unavailable.')
         authority = pm.findtext('k:ExtendedData/k:Data[@name="bms_data_authority"]/k:value',
-                                default='KMZ / tabel sumber', namespaces=NS)
+                                default='Hasil Survey Lapangan', namespaces=NS)
         source_record = {data.get('name')[len(PKRMS_RAW_PREFIX):]: data.findtext('k:value', default='-', namespaces=NS)
                          for data in pm.findall('k:ExtendedData/k:Data', NS)
                          if (data.get('name') or '').startswith(PKRMS_RAW_PREFIX)} or None

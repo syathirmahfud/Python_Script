@@ -1,57 +1,26 @@
-# ==============================
-# Python
-# ==============================
-__pycache__/
-*.py[cod]
-*.pyo
+```
+# Build artifacts
+build_pdf/
 
-# Virtual environments
+# Dependencies
 .venv/
 venv/
-env/
+node_modules/
 
-# ==============================
-# IDE / Editor
-# ==============================
+# Compiled files
+*.pyc
+__pycache__/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Environment files
+.env
+.env.local
+*.env.*
+
+# Editors
 .vscode/
 .idea/
-*.code-workspace
-
-# ==============================
-# Jupyter
-# ==============================
-.ipynb_checkpoints/
-
-# ==============================
-# Build / Packaging
-# ==============================
-build/
-dist/
-*.egg-info/
-
-# ==============================
-# Temporary / Cache
-# ==============================
-*.tmp
-*.temp
-*.bak
-*.log
-~$*
-.cache/
-
-# ==============================
-# Windows
-# ==============================
-Thumbs.db
-desktop.ini
-
-# ==============================
-# Python secrets
-# ==============================
-.env
-.env.*
-*.key
-*.pem
-*.bak
-*.bak_*
-*.zip
+```
